@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 import requests
-import numpy as np  # <-- добавлено
+import numpy as np
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -24,11 +24,15 @@ assistant = AIAssistant()
 if DATA_FILE:
     try:
         assistant.load_history(DATA_FILE)
-        logger.info(f"История загружена из {DATA_FILE} (игр: {assistant.history_count()})")
+        count = assistant.history_count()
+        logger.info(f"История загружена из {DATA_FILE} (игр: {count})")
+        # Логим конкретное сообщение, если игр много
+        if count >= 23000:
+            logger.info(f"🔥 Внимание: загружено {count} игр")
     except Exception as e:
         logger.warning(f"Не удалось загрузить {DATA_FILE}: {e}")
 
-# ===== Keep-alive поток =====
+# ===== Keep-alive поток (бесшумный) =====
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
@@ -36,13 +40,14 @@ def keep_alive():
     while True:
         try:
             resp = requests.get(f"{SELF_URL}/healthz", timeout=5)
-            logger.info(f"Keep-alive ping OK: {resp.status_code}")
+            logger.debug(f"Keep-alive ping OK: {resp.status_code}")  # debug вместо info
         except Exception as e:
             logger.warning(f"Keep-alive error: {e}")
         # случайная пауза 4–6 минут
-        time.sleep(240 + 120 * np.random.rand())  # np.random.rand() теперь работает
+        time.sleep(240 + 120 * np.random.rand())
 
-threading.Thread(target=keep_alive, daemon=True).start()
+# Запускаем поток без блокировки основного приложения
+threading.Thread(target=keep_alive, daemon=True, name="KeepAliveThread").start()
 
 # ===== Модели для API =====
 class BetsPayload(BaseModel):
