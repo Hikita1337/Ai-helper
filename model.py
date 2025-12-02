@@ -250,6 +250,7 @@ class AIAssistant:
     })
 
     logger.info(f"PREDICT game={game_id} safe={safe} med={med} risk={risk} in {time.time()-t0:.3f}s")
+
     
     def get_pred_log(self, limit=20):
         return list(self.pred_log)[-limit:]
