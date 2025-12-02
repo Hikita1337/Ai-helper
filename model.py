@@ -8,7 +8,6 @@ logger = logging.getLogger("ai_assistant.model")
 
 class AIAssistant:
     def __init__(self):
-        # История игр
         self.history_df = pd.DataFrame()
         self.crash_values = []
         self.games_index = set()
@@ -17,12 +16,10 @@ class AIAssistant:
         self.bot_patterns = {}  # uid -> история ставок
         self.pred_log = deque(maxlen=1000)  # лог предиктов
 
-        # Модель для Safe/Med/Risk
         self.model_safe = LGBMRegressor()
         self.model_med = LGBMRegressor()
         self.model_risk = LGBMRegressor()
 
-        # Контроль частоты онлайн-обучения
         self.pending_feedback = []
 
     # -------------------- Загрузка истории --------------------
@@ -53,7 +50,6 @@ class AIAssistant:
                 uid = b.get("user_id")
                 if uid is not None:
                     self.user_counts[uid] += 1
-                    # Сохраняем паттерн бота
                     if uid not in self.bot_patterns:
                         self.bot_patterns[uid] = []
                     self.bot_patterns[uid].append({
@@ -84,7 +80,7 @@ class AIAssistant:
         frac_amount = (bot_amount / total_amount) if total_amount > 0 else 0.0
         return frac_amount, bot_ids
 
-    # -------------------- Основной предикт --------------------
+    # -------------------- Предикт --------------------
     def predict_and_log(self, payload):
         import time
         start = time.time()
@@ -92,28 +88,23 @@ class AIAssistant:
         bets = payload.get("bets") or []
         bot_frac_money, bot_ids = self.detect_bots_in_snapshot(bets)
 
-        # Подготовка признаков для модели
         total_bets = sum(float(b.get("amount") or 0) for b in bets)
         num_bets = len(bets)
         avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
 
         features = np.array([[bot_frac_money, num_bets, total_bets, avg_auto]])
 
-        # Если модель обучена, предсказываем Safe/Med/Risk
         try:
             safe = float(self.model_safe.predict(features))
             med = float(self.model_med.predict(features))
             risk = float(self.model_risk.predict(features))
         except:
-            # Для новых данных используем простые правила
             safe = 1.2
             med = 1.5
             risk = 2.0
 
-        # Процент от банка
         recommended_pct = max(0.5, 2.0*(1-bot_frac_money))
 
-        # Логируем предикт
         self.pred_log.append({
             "game_id": game_id,
             "safe": safe,
@@ -147,7 +138,6 @@ class AIAssistant:
             uid = b.get("user_id")
             if uid is not None:
                 self.user_counts[uid] += 1
-                # обновляем паттерн бота
                 if uid not in self.bot_patterns:
                     self.bot_patterns[uid] = []
                 self.bot_patterns[uid].append({
@@ -158,9 +148,8 @@ class AIAssistant:
 
         self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
 
-        # Добавляем в очередь обратной связи для периодического онлайн-обучения
         self.pending_feedback.append(row)
-        if len(self.pending_feedback) >= 50:  # обучение каждые 50 игр
+        if len(self.pending_feedback) >= 50:
             self._online_train()
             self.pending_feedback.clear()
 
@@ -174,7 +163,6 @@ class AIAssistant:
         if len(self.history_df) < 50:
             return
 
-        # Простая подготовка признаков
         features = []
         safe_targets = []
         med_targets = []
@@ -187,7 +175,6 @@ class AIAssistant:
             num_bets = len(bets)
             avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
             features.append([bot_frac, num_bets, total_bets, avg_auto])
-            # Цели для Safe/Med/Risk — можно брать исторические percentiles
             safe_targets.append(np.percentile([row.crash], 50))
             med_targets.append(np.percentile([row.crash], 75))
             risk_targets.append(np.percentile([row.crash], 90))
