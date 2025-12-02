@@ -8,6 +8,7 @@ from collections import Counter
 
 logger = logging.getLogger("ai_assistant.model")
 
+
 class AIAssistant:
     def __init__(self):
         self.history_df = pd.DataFrame()
@@ -29,11 +30,11 @@ class AIAssistant:
             if gid is None or gid in self.games_index:
                 continue
             self.games_index.add(gid)
-            crash = float(item.get("crash", 0))
-            bets = item.get("bets", [])
-            deposit_sum = item.get("deposit_sum", None)
-            num_players = item.get("num_players", None)
-            bucket = item.get("color_bucket", None)
+            crash = float(item.get("crash") or 0)
+            bets = item.get("bets") or []
+            deposit_sum = item.get("deposit_sum")
+            num_players = item.get("num_players")
+            bucket = item.get("color_bucket")
             rows.append({
                 "game_id": gid,
                 "crash": crash,
@@ -73,7 +74,7 @@ class AIAssistant:
         bot_amount = 0.0
         for b in bets:
             uid = b.get("user_id")
-            amt = float(b.get("amount", 0) or 0)
+            amt = float(b.get("amount") or 0)
             total_amount += amt
             if uid is None:
                 continue
@@ -105,13 +106,13 @@ class AIAssistant:
         import time
         start = time.time()
         game_id = payload.get("game_id")
-        bets = payload.get("bets", [])
-        deposit_sum = payload.get("deposit_sum", None)
-        num_players = payload.get("num_players", len(bets))
+        bets = payload.get("bets") or []
+        deposit_sum = payload.get("deposit_sum")
+        num_players = payload.get("num_players") or len(bets)
         bot_frac_money, bot_ids = self.detect_bots_in_snapshot(bets)
 
-        amounts = [float(b.get("amount", 0) or 0) for b in bets]
-        autos = [float(b.get("auto", 0) or 0) for b in bets if b.get("auto") is not None]
+        amounts = [float(b.get("amount") or 0) for b in bets]
+        autos = [float(b.get("auto") or 0) for b in bets if b.get("auto") is not None]
         total = sum(amounts)
         avg_auto = np.mean(autos) if autos else 1.0
 
@@ -129,7 +130,7 @@ class AIAssistant:
         med  = max(safe + 0.01, round(base_med * adjust_factor * bot_penalty, 2))
         risk = max(med + 0.01, round(base_risk * adjust_factor * bot_penalty, 2))
 
-        point = round(safe * (1 - bot_frac_money) * 0.6 + med * (bot_frac_money) * 0.4, 2)
+        point = round(safe * (1 - bot_frac_money) * 0.6 + med * bot_frac_money * 0.4, 2)
 
         hist_factor = min(1.0, len(self.crash_values) / 50000)
         snap_factor = min(1.0, max(1, len(bets)) / 30)
