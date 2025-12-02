@@ -9,6 +9,7 @@ logger = logging.getLogger("ai_assistant.model")
 
 class AIAssistant:
     def __init__(self):
+        # История игр
         self.history_df = pd.DataFrame()
         self.crash_values = []
         self.games_index = set()
@@ -16,9 +17,16 @@ class AIAssistant:
         self.color_counts = Counter()
         self.bot_patterns = {}  # uid -> история ставок
         self.pred_log = deque(maxlen=1000)  # лог предиктов
+
+        # Последние цвета
+        self.last_colors = deque(maxlen=50)
+
+        # Модель для Safe/Med/Risk
         self.model_safe = LGBMRegressor()
         self.model_med = LGBMRegressor()
         self.model_risk = LGBMRegressor()
+
+        # Контроль частоты онлайн-обучения
         self.pending_feedback = []
 
     # -------------------- Загрузка истории --------------------
@@ -45,10 +53,12 @@ class AIAssistant:
             self.crash_values.append(crash)
             if color_bucket:
                 self.color_counts[color_bucket] += 1
+                self.last_colors.append(color_bucket)
             for b in bets:
                 uid = b.get("user_id")
                 if uid is not None:
                     self.user_counts[uid] += 1
+                    # Сохраняем паттерн бота
                     if uid not in self.bot_patterns:
                         self.bot_patterns[uid] = []
                     self.bot_patterns[uid].append({
@@ -87,11 +97,16 @@ class AIAssistant:
         bets = payload.get("bets") or []
         bot_frac_money, bot_ids = self.detect_bots_in_snapshot(bets)
 
+        # Подготовка признаков
         total_bets = sum(float(b.get("amount") or 0) for b in bets)
         num_bets = len(bets)
         avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
-        features = np.array([[bot_frac_money, num_bets, total_bets, avg_auto]])
 
+        # Частоты последних цветов
+        color_features = self._color_features()
+        features = np.array([[bot_frac_money, num_bets, total_bets, avg_auto] + color_features])
+
+        # Если модель обучена, предсказываем Safe/Med/Risk
         try:
             safe = float(self.model_safe.predict(features))
             med = float(self.model_med.predict(features))
@@ -118,17 +133,29 @@ class AIAssistant:
         logger.info(f"Predicted for game {game_id}: safe={safe}, med={med}, risk={risk}, recommended_pct={recommended_pct:.2f}")
         logger.info(f"=== END PREDICT in {time.time()-start:.3f}s ===")
 
+    # -------------------- Фичи цветов --------------------
+    def _color_features(self):
+        counts = Counter(self.last_colors)
+        colors = ["red", "blue", "pink", "green", "yellow", "gradient"]
+        total = len(self.last_colors) or 1
+        return [counts[c]/total for c in colors]
+
     # -------------------- Обратная связь и онлайн-обучение --------------------
-    def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False):
+    def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False, color_bucket=None):
         self.games_index.add(game_id)
         self.crash_values.append(float(crash))
+        if color_bucket:
+            self.last_colors.append(color_bucket)
+            self.color_counts[color_bucket] += 1
+
         row = {
             "game_id": game_id,
             "crash": float(crash),
             "bets": bets or [],
             "deposit_sum": deposit_sum,
             "num_players": num_players,
-            "fast_game": fast_game
+            "fast_game": fast_game,
+            "color_bucket": color_bucket
         }
 
         for b in row["bets"]:
@@ -146,6 +173,7 @@ class AIAssistant:
         self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
         self.pending_feedback.append(row)
 
+        # Онлайн-обучение каждые 50 игр
         if len(self.pending_feedback) >= 50:
             self._online_train()
             self.pending_feedback.clear()
@@ -159,14 +187,21 @@ class AIAssistant:
     def _online_train(self):
         if len(self.history_df) < 50:
             return
-        features, safe_targets, med_targets, risk_targets = [], [], [], []
+
+        features = []
+        safe_targets = []
+        med_targets = []
+        risk_targets = []
+
         for row in self.history_df[-50:].itertuples():
             bets = row.bets or []
             bot_frac, _ = self.detect_bots_in_snapshot(bets)
             total_bets = sum(float(b.get("amount") or 0) for b in bets)
             num_bets = len(bets)
             avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
-            features.append([bot_frac, num_bets, total_bets, avg_auto])
+            color_features = self._color_features()
+            features.append([bot_frac, num_bets, total_bets, avg_auto] + color_features)
+
             safe_targets.append(np.percentile([row.crash], 50))
             med_targets.append(np.percentile([row.crash], 75))
             risk_targets.append(np.percentile([row.crash], 90))
@@ -175,6 +210,7 @@ class AIAssistant:
         self.model_safe.fit(X, np.array(safe_targets))
         self.model_med.fit(X, np.array(med_targets))
         self.model_risk.fit(X, np.array(risk_targets))
+
         logger.info("Online training completed for last 50 games.")
 
     # -------------------- Анализ цветов --------------------
