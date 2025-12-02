@@ -1,59 +1,68 @@
 import numpy as np
 import pandas as pd
-import json
+from collections import Counter, deque
 import logging
-from collections import Counter
+from lightgbm import LGBMRegressor
 
 logger = logging.getLogger("ai_assistant.model")
 
 class AIAssistant:
     def __init__(self):
+        # История игр
         self.history_df = pd.DataFrame()
-        self.user_counts = Counter()
         self.crash_values = []
-        self.color_counts = Counter()
         self.games_index = set()
-        self.last_logs = []  # лог предсказаний + фактический краш
+        self.user_counts = Counter()
+        self.color_counts = Counter()
+        self.bot_patterns = {}  # uid -> история ставок
+        self.pred_log = deque(maxlen=1000)  # лог предиктов
+
+        # Модель для Safe/Med/Risk
+        self.model_safe = LGBMRegressor()
+        self.model_med = LGBMRegressor()
+        self.model_risk = LGBMRegressor()
+
+        # Контроль частоты онлайн-обучения
+        self.pending_feedback = []
 
     # -------------------- Загрузка истории --------------------
-    def load_history(self, path):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        self.load_history_from_list(data)
-
     def load_history_from_list(self, games_list):
         rows = []
         for item in games_list:
             gid = item.get("game_id") or item.get("id")
-            if gid is None or gid in self.games_index:
+            if gid in self.games_index:
                 continue
             self.games_index.add(gid)
             crash = float(item.get("crash") or 0)
             bets = item.get("bets") or []
             deposit_sum = item.get("deposit_sum")
             num_players = item.get("num_players")
-            bucket = item.get("color_bucket")
+            color_bucket = item.get("color_bucket")
             rows.append({
                 "game_id": gid,
                 "crash": crash,
                 "bets": bets,
                 "deposit_sum": deposit_sum,
                 "num_players": num_players,
-                "color_bucket": bucket,
-                "fast_game": False
+                "color_bucket": color_bucket
             })
+            self.crash_values.append(crash)
+            if color_bucket:
+                self.color_counts[color_bucket] += 1
             for b in bets:
                 uid = b.get("user_id")
                 if uid is not None:
                     self.user_counts[uid] += 1
-            self.crash_values.append(crash)
-            if bucket:
-                self.color_counts[bucket] += 1
+                    # Сохраняем паттерн бота
+                    if uid not in self.bot_patterns:
+                        self.bot_patterns[uid] = []
+                    self.bot_patterns[uid].append({
+                        "amount": float(b.get("amount") or 0),
+                        "auto": float(b.get("auto") or 0),
+                        "crash": crash
+                    })
         self.history_df = pd.DataFrame(rows)
         logger.info(f"Loaded {len(self.history_df)} games; unique users: {len(self.user_counts)}")
-
-    def history_count(self):
-        return len(self.history_df)
 
     # -------------------- Детекция ботов --------------------
     def detect_bots_in_snapshot(self, bets):
@@ -75,127 +84,137 @@ class AIAssistant:
         frac_amount = (bot_amount / total_amount) if total_amount > 0 else 0.0
         return frac_amount, bot_ids
 
-    # -------------------- Основной прогноз --------------------
-    def _crash_percentiles(self, tail=None):
-        if not self.crash_values:
-            return {}
-        arr = np.array(self.crash_values)
-        if tail:
-            arr = arr[-tail:]
-        return {
-            "p50": float(np.percentile(arr, 50)),
-            "p60": float(np.percentile(arr, 60)),
-            "p75": float(np.percentile(arr, 75)),
-            "p90": float(np.percentile(arr, 90)),
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
-            "count": len(arr)
-        }
-
+    # -------------------- Основной предикт --------------------
     def predict_and_log(self, payload):
         import time
         start = time.time()
         game_id = payload.get("game_id")
         bets = payload.get("bets") or []
-        deposit_sum = payload.get("deposit_sum")
-        num_players = payload.get("num_players") or len(bets)
         bot_frac_money, bot_ids = self.detect_bots_in_snapshot(bets)
 
-        amounts = [float(b.get("amount") or 0) for b in bets]
-        autos = [float(b.get("auto") or 0) for b in bets if b.get("auto") is not None]
-        total = sum(amounts)
-        avg_auto = np.mean(autos) if autos else 1.0
+        # Подготовка признаков для модели
+        total_bets = sum(float(b.get("amount") or 0) for b in bets)
+        num_bets = len(bets)
+        avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
 
-        percentiles_recent = self._crash_percentiles(tail=2000)
-        percentiles_all = self._crash_percentiles()
+        features = np.array([[bot_frac_money, num_bets, total_bets, avg_auto]])
 
-        base_safe = percentiles_recent.get("p60") or percentiles_all.get("p60") or 1.2
-        base_med  = percentiles_recent.get("p75") or percentiles_all.get("p75") or 1.5
-        base_risk = percentiles_recent.get("p90") or percentiles_all.get("p90") or 2.0
+        # Если модель обучена, предсказываем Safe/Med/Risk
+        try:
+            safe = float(self.model_safe.predict(features))
+            med = float(self.model_med.predict(features))
+            risk = float(self.model_risk.predict(features))
+        except:
+            # Для новых данных используем простые правила
+            safe = 1.2
+            med = 1.5
+            risk = 2.0
 
-        adjust_factor = 1.0 + (avg_auto - 1.0) * 0.05
-        bot_penalty = 1.0 - min(0.5, bot_frac_money * 0.8)
+        # Процент от банка
+        recommended_pct = max(0.5, 2.0*(1-bot_frac_money))
 
-        safe = max(1.01, round(base_safe * adjust_factor * bot_penalty, 2))
-        med  = max(safe + 0.01, round(base_med * adjust_factor * bot_penalty, 2))
-        risk = max(med + 0.01, round(base_risk * adjust_factor * bot_penalty, 2))
-
-        point = round(safe * (1 - bot_frac_money) * 0.6 + med * bot_frac_money * 0.4, 2)
-
-        hist_factor = min(1.0, len(self.crash_values) / 50000)
-        snap_factor = min(1.0, max(1, len(bets)) / 30)
-        bot_factor = max(0.2, 1.0 - bot_frac_money)
-        confidence = int(round((0.3*hist_factor + 0.5*snap_factor + 0.2*bot_factor)*100))
-        confidence = max(5, min(99, confidence))
-
-        rec_safe_pct = round(max(0.5, 2.0*(confidence/100)), 2)
-        rec_med_pct = round(max(0.5, rec_safe_pct*2.0), 2)
-        rec_risk_pct = round(max(0.3, rec_safe_pct*4.0), 2)
-
-        color_probs = self.estimate_color_probs()
-
-        # Лог предсказаний
-        log_entry = {
+        # Логируем предикт
+        self.pred_log.append({
             "game_id": game_id,
             "safe": safe,
             "med": med,
             "risk": risk,
-            "point": point,
-            "confidence": confidence,
-            "color_probs": color_probs,
-            "fast_game": False,
-            "crash": None
-        }
-        self.last_logs.append(log_entry)
-        if len(self.last_logs) > 100:
-            self.last_logs = self.last_logs[-100:]
+            "recommended_pct": recommended_pct,
+            "bot_frac_money": bot_frac_money,
+            "num_bets": num_bets,
+            "total_bets": total_bets,
+            "timestamp": time.time()
+        })
 
-        logger.info(f"=== PREDICT (game {game_id}) in {time.time()-start:.3f}s ===")
+        logger.info(f"Predicted for game {game_id}: safe={safe}, med={med}, risk={risk}, recommended_pct={recommended_pct:.2f}")
+        logger.info(f"=== END PREDICT in {time.time()-start:.3f}s ===")
 
-    # -------------------- Feedback --------------------
+    # -------------------- Обратная связь и онлайн-обучение --------------------
     def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False):
         self.games_index.add(game_id)
         self.crash_values.append(float(crash))
+
         row = {
             "game_id": game_id,
             "crash": float(crash),
             "bets": bets or [],
             "deposit_sum": deposit_sum,
             "num_players": num_players,
-            "color_bucket": None,
             "fast_game": fast_game
         }
 
-        # Обновляем статистику пользователей
         for b in row["bets"]:
             uid = b.get("user_id")
             if uid is not None:
                 self.user_counts[uid] += 1
+                # обновляем паттерн бота
+                if uid not in self.bot_patterns:
+                    self.bot_patterns[uid] = []
+                self.bot_patterns[uid].append({
+                    "amount": float(b.get("amount") or 0),
+                    "auto": float(b.get("auto") or 0),
+                    "crash": crash
+                })
 
         self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
 
-        # Обновляем лог последнего предсказания, если оно было
-        if self.last_logs and self.last_logs[-1]["game_id"] == game_id:
-            self.last_logs[-1]["crash"] = crash
-            self.last_logs[-1]["fast_game"] = fast_game
+        # Добавляем в очередь обратной связи для периодического онлайн-обучения
+        self.pending_feedback.append(row)
+        if len(self.pending_feedback) >= 50:  # обучение каждые 50 игр
+            self._online_train()
+            self.pending_feedback.clear()
 
         if fast_game:
-            logger.info(f"Быстрая игра {game_id} обработана без визуального предикта")
+            logger.info(f"Fast game {game_id} processed without visual prediction")
         else:
-            logger.info(f"Feedback: добавлена игра {game_id}, crash={crash}. Всего игр: {len(self.crash_values)}")
+            logger.info(f"Feedback added for game {game_id}, crash={crash}")
 
-    # -------------------- Color probabilities --------------------
+    # -------------------- Онлайн-обучение --------------------
+    def _online_train(self):
+        if len(self.history_df) < 50:
+            return
+
+        # Простая подготовка признаков
+        features = []
+        safe_targets = []
+        med_targets = []
+        risk_targets = []
+
+        for row in self.history_df[-50:].itertuples():
+            bets = row.bets or []
+            bot_frac, _ = self.detect_bots_in_snapshot(bets)
+            total_bets = sum(float(b.get("amount") or 0) for b in bets)
+            num_bets = len(bets)
+            avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
+            features.append([bot_frac, num_bets, total_bets, avg_auto])
+            # Цели для Safe/Med/Risk — можно брать исторические percentiles
+            safe_targets.append(np.percentile([row.crash], 50))
+            med_targets.append(np.percentile([row.crash], 75))
+            risk_targets.append(np.percentile([row.crash], 90))
+
+        X = np.array(features)
+        self.model_safe.fit(X, np.array(safe_targets))
+        self.model_med.fit(X, np.array(med_targets))
+        self.model_risk.fit(X, np.array(risk_targets))
+
+        logger.info("Online training completed for last 50 games.")
+
+    # -------------------- Анализ цветов --------------------
     def estimate_color_probs(self):
         if not self.crash_values:
             return {}
         arr = np.array(self.crash_values)
         buckets = {
-            "red": ((arr < 1.2).sum()),
-            "blue": (((arr >= 1.2) & (arr < 2)).sum()),
-            "pink": (((arr >= 2) & (arr < 4)).sum()),
-            "green": (((arr >= 4) & (arr < 8)).sum()),
-            "yellow": (((arr >= 8) & (arr < 25)).sum()),
-            "gradient": ((arr >= 25).sum()),
+            "red": (arr < 1.2).sum(),
+            "blue": ((arr >= 1.2) & (arr < 2)).sum(),
+            "pink": ((arr >= 2) & (arr < 4)).sum(),
+            "green": ((arr >= 4) & (arr < 8)).sum(),
+            "yellow": ((arr >= 8) & (arr < 25)).sum(),
+            "gradient": (arr >= 25).sum()
         }
         total = float(len(arr))
         return {k: round(v/total, 3) for k, v in buckets.items()}
+
+    # -------------------- Получение лога предиктов --------------------
+    def get_pred_log(self, limit=20):
+        return list(self.pred_log)[-limit:]
