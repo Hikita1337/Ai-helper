@@ -5,6 +5,6 @@ numpy==2.3.5
 pandas==2.2.3
 requests==2.32.5
 python-dotenv==1.2.1
-mega.py==0.4.5        # библиотека для работы с Mega
+mega.py==0.9.20        # библиотека для работы с Mega
 lightgbm==3.4.2       # LightGBM модели
 ably==1.2.1
