@@ -7,7 +7,7 @@ import requests
 import json
 from ably import AblyRest
 from model import AIAssistant
-from mega_lite import Mega  # используем mega-lite вместо mega.client
+from mega_lite import MegaLite  # версия 2.x
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
@@ -24,14 +24,14 @@ assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("crash_ai_hud")
 
-m = None
-FOLDER = None
-
 # ====================== Mega ======================
+m: MegaLite | None = None
+FOLDER: str | None = None
+
 async def mega_connect():
     global m, FOLDER
     if m is None:
-        m = Mega()
+        m = MegaLite()
         await m.login(MEGA_EMAIL, MEGA_PASSWORD)
         FOLDER = await m.find(MEGA_FOLDER)
         if not FOLDER:
@@ -42,6 +42,24 @@ async def mega_find_file(name: str):
     await mega_connect()
     files = await m.find(name)
     return files[0] if files else None
+
+async def mega_upload_file(local_path: str):
+    await mega_connect()
+    await m.upload(local_path, FOLDER)
+    logger.info(f"Uploaded {local_path} to Mega")
+
+async def mega_download_file(remote_name: str, local_path: str):
+    await mega_connect()
+    file = await mega_find_file(remote_name)
+    if file:
+        await m.download(file, local_path)
+        logger.info(f"Downloaded {remote_name} from Mega")
+
+async def mega_delete_file(name: str):
+    file = await mega_find_file(name)
+    if file:
+        await m.delete(file)
+        logger.info(f"Deleted {name} from Mega")
 
 # ====================== BACKUP ======================
 BACKUP_NAME = "assistant_backup.json"
@@ -66,8 +84,7 @@ async def save_backup():
             json.dump(assistant.export_state(), f)
 
         # Загружаем на Mega
-        logger.info("Uploading new backup to Mega...")
-        await m.upload(BACKUP_NAME, FOLDER)
+        await mega_upload_file(BACKUP_NAME)
 
         # Перемещаем старый бэкап в корзину
         file_old = await mega_find_file(OLD_BACKUP_NAME)
@@ -76,7 +93,6 @@ async def save_backup():
             logger.info("Old backup moved to Trash")
 
         logger.info("Backup updated successfully")
-
     except Exception as e:
         logger.error(f"Backup failed: {e}")
 
@@ -87,12 +103,11 @@ async def save_backup_loop():
 
 async def restore_backup():
     try:
-        await mega_connect()
         file = await mega_find_file(BACKUP_NAME)
         if not file:
             logger.warning("No backups found")
             return
-        await m.download(file, BACKUP_NAME)
+        await mega_download_file(BACKUP_NAME, BACKUP_NAME)
         with open(BACKUP_NAME) as f:
             assistant.load_state(json.load(f))
         logger.info("Assistant state restored")
@@ -107,7 +122,7 @@ async def load_big_history(filename="crash_23k.json"):
             return
 
         logger.info("Downloading history from Mega...")
-        await m.download(file, filename)
+        await mega_download_file(filename, filename)
 
         with open(filename) as f:
             data = json.load(f)
