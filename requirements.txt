@@ -6,7 +6,7 @@ pandas==2.2.3
 requests==2.32.5
 python-dotenv==1.2.1
 lightgbm==4.6.0
-mega.py=1.0.8,
+mega.py=1.0.8
 tenacity>=8.2.2
 ably==1.2.0
 pycryptodome>=3.18.0
