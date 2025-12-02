@@ -7,7 +7,7 @@ import requests
 import json
 from ably import AblyRest
 from model import AIAssistant
-from mega.client import Mega
+from mega_lite import Mega  # используем mega-lite вместо mega.client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
@@ -51,25 +51,25 @@ async def save_backup():
     try:
         await mega_connect()
 
-        # Clean trash before backup
+        # Очистка корзины
         trash = await m.get_files_in_node(await m.get_trash_folder())
         for t in trash.values():
             await m.delete(t)
 
-        # Rename previous backup
+        # Переименовываем предыдущий бэкап
         file = await mega_find_file(BACKUP_NAME)
         if file:
             await m.rename(file, OLD_BACKUP_NAME)
 
-        # Save new backup locally
+        # Сохраняем новый бэкап локально
         with open(BACKUP_NAME, "w") as f:
             json.dump(assistant.export_state(), f)
 
-        # Upload
+        # Загружаем на Mega
         logger.info("Uploading new backup to Mega...")
         await m.upload(BACKUP_NAME, FOLDER)
 
-        # Move old backup to trash
+        # Перемещаем старый бэкап в корзину
         file_old = await mega_find_file(OLD_BACKUP_NAME)
         if file_old:
             await m.move(file_old, await m.get_trash_folder())
@@ -83,7 +83,7 @@ async def save_backup():
 async def save_backup_loop():
     while True:
         await save_backup()
-        await asyncio.sleep(3600)  # 1 час
+        await asyncio.sleep(3600)
 
 async def restore_backup():
     try:
@@ -118,12 +118,8 @@ async def load_big_history(filename="crash_23k.json"):
             logger.info(f"Loaded block {i}-{min(i+block, len(data))}")
 
         logger.info("Full history loaded successfully")
-
     except Exception as e:
         logger.error(f"History load error: {e}")
-
-async def load_big_history_loop():
-    await load_big_history()
 
 # ====================== KEEP ALIVE ======================
 async def keep_alive_loop():
@@ -151,7 +147,7 @@ class FeedbackPayload(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(save_backup_loop())
-    asyncio.create_task(load_big_history_loop())
+    asyncio.create_task(load_big_history())
     asyncio.create_task(keep_alive_loop())
     await restore_backup()
 
