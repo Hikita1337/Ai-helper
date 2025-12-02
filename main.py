@@ -16,6 +16,7 @@ SELF_URL = os.getenv("SELF_URL")
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
 
+# ===== KEEP-ALIVE =====
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
@@ -30,6 +31,7 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
+# ===== Pydantic Models =====
 class BetsPayload(BaseModel):
     game_id: int
     bets: list
@@ -47,8 +49,9 @@ class FeedbackPayload(BaseModel):
 class LoadGamesPayload(BaseModel):
     url: str
 
+# ===== ENDPOINTS =====
 @app.post("/predict", status_code=204)
-async def predict(payload: BetsPayload, request: Request):
+async def predict(payload: BetsPayload):
     try:
         assistant.predict_and_log(payload.model_dump())
     except Exception as e:
@@ -58,10 +61,7 @@ async def predict(payload: BetsPayload, request: Request):
 @app.post("/feedback")
 async def feedback(payload: FeedbackPayload):
     try:
-        fast_game = False
-        if payload.bets and payload.crash:
-            fast_game = True
-
+        fast_game = bool(payload.bets and payload.crash)
         assistant.process_feedback(
             game_id=payload.game_id,
             crash=payload.crash,
@@ -70,13 +70,7 @@ async def feedback(payload: FeedbackPayload):
             num_players=payload.num_players,
             fast_game=fast_game
         )
-
-        if fast_game:
-            logger.info(f"Быстрая игра {payload.game_id}, визуальный предикт пропущен")
-            return {"status": "ok", "fast_game": True}
-
-        return {"status": "ok"}
-
+        return {"status": "ok", "fast_game": fast_game}
     except Exception as e:
         logger.exception("Ошибка в /feedback")
         raise HTTPException(status_code=500, detail=str(e))
@@ -95,8 +89,7 @@ async def load_games(payload: LoadGamesPayload):
             if "bets" in game and isinstance(game["bets"], str):
                 try:
                     game["bets"] = json.loads(game["bets"])
-                except Exception as e:
-                    logger.warning(f"Не удалось распарсить bets для game_id {game.get('game_id')}: {e}")
+                except:
                     game["bets"] = []
         assistant.load_history_from_list(data)
         logger.info(f"Игры загружены! Всего в истории: {assistant.history_df.shape[0]}")
@@ -107,8 +100,9 @@ async def load_games(payload: LoadGamesPayload):
 
 @app.get("/logs")
 async def get_logs(limit: int = 20):
-    return {"logs": assistant.get_pred_log(limit=limit)}
+    return {"logs": assistant.get_pred_log(limit)}
 
+# ===== RUN =====
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
