@@ -5,20 +5,17 @@ import logging
 import threading
 import time
 import requests
-import numpy as np
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant")
 
-# ===== CONFIG =====
 PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
 
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
 
-# ===== KEEP-ALIVE =====
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
@@ -33,7 +30,6 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# ===== Pydantic Models =====
 class BetsPayload(BaseModel):
     game_id: int
     bets: list
@@ -51,7 +47,6 @@ class FeedbackPayload(BaseModel):
 class LoadGamesPayload(BaseModel):
     url: str
 
-# ===== ENDPOINTS =====
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
@@ -96,7 +91,6 @@ async def load_games(payload: LoadGamesPayload):
         resp = requests.get(payload.url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-
         for game in data:
             if "bets" in game and isinstance(game["bets"], str):
                 try:
@@ -104,23 +98,17 @@ async def load_games(payload: LoadGamesPayload):
                 except Exception as e:
                     logger.warning(f"Не удалось распарсить bets для game_id {game.get('game_id')}: {e}")
                     game["bets"] = []
-
         assistant.load_history_from_list(data)
-        logger.info(f"Игры загружены! Всего в истории: {assistant.history_count()}")
-        return {"status": "ok", "games_loaded": assistant.history_count()}
-
+        logger.info(f"Игры загружены! Всего в истории: {assistant.history_df.shape[0]}")
+        return {"status": "ok", "games_loaded": assistant.history_df.shape[0]}
     except Exception as e:
         logger.exception("Ошибка при загрузке игр")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/logs")
 async def get_logs(limit: int = 20):
-    """
-    Отдает последние предсказания с фактическими крашами и fast_game флагом
-    """
-    return {"logs": assistant.last_logs[-limit:]}
+    return {"logs": assistant.get_pred_log(limit=limit)}
 
-# ===== RUN =====
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)
