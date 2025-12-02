@@ -1,292 +1,362 @@
-# ai_helper.py
-import os
-import json
-import math
-from collections import Counter, deque, defaultdict
+#!/usr/bin/env python3
+# ai_agent.py
+# Лёгкий AI-помощник для прогнозов по парсеру игры crash.
+# Требования: Python 3.9+, Flask
+# Запуск: python ai_agent.py
+# Endpoints:
+#  POST /load   { "url": "<http or local path to json array>" }
+#  POST /predict  { "players":[{ "user_id":..., "name":"...", "amount":..., "auto":... }], "game_id": 6233375, "bank": 100.0 }
+#  POST /result { "game_id":..., "crash": ... }
+#  GET  /status  -> краткая статистика
+#
+# Форматы входа совпадают с тем, что у тебя: "bets" items: user_id, name, amount, auto
+# Цвета в исторической базе: "red","blue","pink","green","yellow","gradient"
+#
 from flask import Flask, request, jsonify
-import numpy as np
+import json, math, time, threading, urllib.request
+from collections import Counter, defaultdict, deque
 
-# ========== Настройки ==========
-HISTORICAL_FILE = os.environ.get("HISTORICAL_FILE", "games_merged.json")
-PORT = int(os.environ.get("PORT", 5000))
-
-# Параметры анализа
-MAX_SEQ = 5                       # максимальная длина последовательностей цветов
-MIN_BOT_BETS = 50                 # порог для пометки юзера как "бот" (по историке)
-BANK_PERCENT_BASE = 0.03          # базовый % от банка, если ничего подозрительного
-BOT_RISK_PENALTY = 0.5            # как сильно уменьшаем % при сильном бот-давлении
-SAFE_QUANTILE = 0.25
-MID_QUANTILE = 0.50
-HIGH_QUANTILE = 0.75
-
-# ========== Вспомогательные ==========
-def color_of(crash):
-    c = float(crash)
-    if 1 <= c <= 1.19:
-        return "red"
-    if 1.2 <= c <= 1.99:
-        return "blue"
-    if 2 <= c <= 3.99:
-        return "pink"
-    if 4 <= c <= 7.99:
-        return "green"
-    if 8 <= c <= 24.99:
-        return "yellow"
-    return "gradient"
-
-def percentile(arr, q):
-    if not arr:
-        return None
-    return float(np.percentile(arr, q * 100))
-
-# ========== Хранение данных в памяти ==========
-games = []                         # список {id, crash, color, ...}
-color_history = []                 # список цветов в порядке исторических игр
-seq_counters = {l: Counter() for l in range(1, MAX_SEQ+1)}
-crash_by_color = defaultdict(list) # color -> list of crashes
-
-# профиль пользователей: user_id -> {'count': int, 'autos': Counter(), 'amount': total_amount}
-user_profiles = defaultdict(lambda: {"count":0, "autos": Counter(), "amount":0.0})
-
-# быстрый буфер последних цветов (для предсказания)
-recent_colors = deque(maxlen=MAX_SEQ)
-
-# ========== Загрузка исторической базы ==========
-def load_historical(path):
-    if not os.path.exists(path):
-        print("Historical file not found:", path)
-        return
-    print("Loading historical file:", path)
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for g in data:
-        try:
-            crash = float(g.get("crash"))
-        except Exception:
-            continue
-        color = color_of(crash)
-        games.append({"id": g.get("id"), "crash": crash, "color": color, "bets": g.get("bets")})
-        color_history.append(color)
-        crash_by_color[color].append(crash)
-        # update sequence counters after building full list
-    # build seq counters
-    for i in range(len(color_history)):
-        for l in range(1, MAX_SEQ+1):
-            if i + l <= len(color_history):
-                seq = tuple(color_history[i:i+l])
-                seq_counters[l][seq] += 1
-    # build user profiles from bets in history if present
-    for g in data:
-        bets = g.get("bets") or []
-        for b in bets:
-            try:
-                uid = b.get("user_id")
-                auto = float(b.get("auto", 0))
-                amt = float(b.get("amount", 0) or 0)
-            except Exception:
-                continue
-            profile = user_profiles[uid]
-            profile["count"] += 1
-            profile["autos"][round(auto,2)] += 1
-            profile["amount"] += amt
-    recent_colors.extend(color_history[-MAX_SEQ:])
-    print(f"Loaded {len(games)} games, {len(user_profiles)} users profiled.")
-
-# ========== Utility: detect bots heuristically ==========
-def is_bot_profile(profile):
-    # простая эвристика: много ставок в истории OR очень repetitive autos OR tiny user_id numeric names omitted
-    if profile["count"] >= MIN_BOT_BETS:
-        return True
-    # if top auto frequency is large fraction
-    total = profile["count"]
-    if total >= 5:
-        top = profile["autos"].most_common(1)[0][1]
-        if top / total >= 0.8:
-            return True
-    return False
-
-def top_auto_of_profile(profile):
-    if not profile["autos"]:
-        return None
-    return profile["autos"].most_common(1)[0][0]
-
-# ========== Sequence prediction ==========
-def predict_next_color_by_sequence(recent_colors_list):
-    # Try longest match first: find sequences ending with recent_colors_list and return most common continuation
-    for l in range(MAX_SEQ, 0, -1):
-        if len(recent_colors_list) < l:
-            continue
-        key = tuple(recent_colors_list[-l:])
-        # Find sequences of length l+1 where prefix == key
-        candidate = Counter()
-        for seq, cnt in seq_counters.get(l+1, {}).items():
-            if seq[:-1] == key:
-                candidate[seq[-1]] += cnt
-        if candidate:
-            return candidate.most_common(1)[0][0]
-    # fallback: most frequent color globally
-    global_counts = Counter()
-    for col, arr in crash_by_color.items():
-        global_counts[col] = len(arr)
-    if not global_counts:
-        return None
-    return global_counts.most_common(1)[0][0]
-
-# ========== Core prediction logic ==========
-def compute_prediction(current_bets, bank_amount=None):
-    # update temporary stats from incoming bets (but do not persist permanently unless desired)
-    # classify current bets: count bots among current bettors by historical profile and by heuristics (frequent bettors)
-    current_count = len(current_bets)
-    if current_count == 0:
-        return {"error":"no current bets"}
-
-    # update user profiles online (we will persist these updates into user_profiles)
-    bot_votes = 0
-    total_bet_amount = 0.0
-    weighted_auto_sum = 0.0
-    weighted_count = 0.0
-
-    for b in current_bets:
-        uid = b.get("user_id")
-        auto = float(b.get("auto", 1.0))
-        amt = float(b.get("amount", 0) or 0)
-        # update profile
-        profile = user_profiles[uid]
-        profile["count"] += 1
-        profile["autos"][round(auto,2)] += 1
-        profile["amount"] += amt
-
-        total_bet_amount += amt
-        weighted_auto_sum += auto * max(amt, 0.01)
-        weighted_count += max(amt, 0.01)
-
-        # detect if this user looks like bot (quick heuristic using updated profile)
-        if is_bot_profile(profile):
-            bot_votes += 1
-
-    # determine bot pressure: fraction of bettors that are bots
-    bot_fraction = bot_votes / current_count
-
-    # baseline avg auto (weighted)
-    avg_auto = (weighted_auto_sum / weighted_count) if weighted_count else np.mean([b.get("auto",1.0) for b in current_bets])
-
-    # sequence-based color prediction
-    next_color = predict_next_color_by_sequence(list(recent_colors))
-
-    # distribution-based crash percentiles for predicted color (fallback to global)
-    target_color = next_color or ("all")
-    if target_color in crash_by_color and crash_by_color[target_color]:
-        arr = crash_by_color[target_color]
-    else:
-        # global array
-        arr = []
-        for v in crash_by_color.values():
-            arr.extend(v)
-    if not arr:
-        # fallback simple heuristic based on avg_auto
-        safe = max(1.01, round(avg_auto * 0.9, 2))
-        mid = round(avg_auto, 2)
-        high = round(avg_auto * 1.15 + 0.01, 2)
-    else:
-        safe = round(percentile(arr, SAFE_QUANTILE), 2)
-        mid = round(percentile(arr, MID_QUANTILE), 2)
-        high = round(percentile(arr, HIGH_QUANTILE), 2)
-
-    # Bank percent recommendation: reduce if many bots or if many large bets concentrated
-    suggested_percent = BANK_PERCENT_BASE
-    # if a lot of total bet amount relative to bank, be more conservative
-    if bank_amount and bank_amount > 0:
-        exposure = total_bet_amount / bank_amount
-        # exposure high -> reduce percent
-        if exposure > 0.05:
-            suggested_percent *= 0.6
-        if exposure > 0.1:
-            suggested_percent *= 0.5
-    # apply bot penalty
-    if bot_fraction > 0.2:
-        suggested_percent *= (1 - BOT_RISK_PENALTY * bot_fraction)  # decrease with bot fraction
-    suggested_percent = max(0.001, round(suggested_percent, 4))
-
-    # update recent colors buffer using last seen (we don't have final result yet), don't mutate historical seq_counters here
-    # but we can compute diagnostics: last N colors
-    diagnostics = {
-        "bot_fraction": round(bot_fraction, 3),
-        "current_bets_count": current_count,
-        "avg_auto_weighted": round(avg_auto, 3),
-        "predicted_color": next_color,
-        "safe_crash": safe,
-        "mid_crash": mid,
-        "high_crash": high,
-        "suggested_bank_percent": suggested_percent,
-        "historical_games_count": len(games)
-    }
-
-    return diagnostics
-
-# ========== Flask API ==========
 app = Flask(__name__)
 
-@app.route("/predict", methods=["POST"])
-def predict_endpoint():
-    payload = request.get_json(force=True)
-    bets = payload.get("bets", [])
-    bank_amount = payload.get("bank")   # optional, numeric
-    # normalize bets: list of dicts with keys user_id, auto, amount
-    norm_bets = []
-    for b in bets:
-        try:
-            norm_bets.append({
-                "user_id": b.get("user_id"),
-                "auto": float(b.get("auto", 1.0)),
-                "amount": float(b.get("amount", 0) or 0)
-            })
-        except Exception:
+# -----------------------
+# Конфигурация / память
+# -----------------------
+HISTORY = []           # список dict с полями: game_id, crash, color_bucket, bets, deposit_sum, num_players, created_at(optional)
+TOTAL_LOCK = threading.Lock()
+
+# Быстрая аггрегация
+TOTAL_GAMES = 0
+CRASHES = []           # список float
+COLOR_SEQ = []         # последовательность color_bucket по порядку (для частых цепочек)
+USER_BET_COUNTS = Counter()  # как часто встречается username
+USER_TOTAL_AMOUNT = defaultdict(float)
+
+# Порог для выделения «ботов» по частоте
+BOT_FREQ_THRESHOLD = 300    # если юзер в истории > threshold — помечаем как бот (значение ориентировочное)
+# Limiting bet fraction
+MAX_BANK_FRACTION = 0.20    # никогда не рекомендуем >20% от банка
+
+# Пороговые множители для safe/medium/risky
+LEVEL_PROBS = {
+    "safe": 0.90,
+    "medium": 0.70,
+    "risky": 0.50
+}
+
+# Предопределённые пороги коэффициентов, которые мы проверяем
+CHECK_COEFS = [1.2, 1.5, 2, 3, 4, 5, 8, 10, 25]
+
+# -----------------------
+# Утилиты
+# -----------------------
+def recalc_indexes():
+    """Пересчитать вспомогательные структуры на основе HISTORY (должно вызываться под lock)."""
+    global TOTAL_GAMES, CRASHES, COLOR_SEQ, USER_BET_COUNTS, USER_TOTAL_AMOUNT
+    TOTAL_GAMES = len(HISTORY)
+    CRASHES = [h['crash'] for h in HISTORY if isinstance(h.get('crash'), (int,float))]
+    COLOR_SEQ = [h.get('color_bucket') for h in HISTORY if h.get('color_bucket')]
+    USER_BET_COUNTS = Counter()
+    USER_TOTAL_AMOUNT = defaultdict(float)
+    for h in HISTORY:
+        bets = h.get('bets') or []
+        for b in bets:
+            name = b.get('name') or str(b.get('user_id'))
+            USER_BET_COUNTS[name] += 1
+            try:
+                USER_TOTAL_AMOUNT[name] += float(b.get('amount') or 0)
+            except:
+                pass
+
+def load_json_from_url_or_file(path_or_url):
+    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+        with urllib.request.urlopen(path_or_url, timeout=30) as r:
+            raw = r.read()
+            # try decode as utf-8
+            text = raw.decode('utf-8', errors='ignore')
+            return json.loads(text)
+    else:
+        with open(path_or_url, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+def safediv(a,b):
+    try:
+        return a/b
+    except:
+        return 0.0
+
+def prob_crash_ge(threshold):
+    """Оценка вероятности (историческая) что crash >= threshold."""
+    if not CRASHES: return 0.0
+    count = sum(1 for c in CRASHES if c >= threshold)
+    return count/len(CRASHES)
+
+def most_common_color_sequences(k=3, window=3):
+    """Ищем частые подпоследовательности цветов длины window."""
+    seqs = Counter()
+    s = [c for c in COLOR_SEQ if c]
+    for i in range(len(s)-window+1):
+        seqs[tuple(s[i:i+window])] += 1
+    return seqs.most_common(k)
+
+def detect_bots_from_players(players):
+    """Определим какая доля суммы сейчас — от вероятных ботов (по истории)."""
+    if not players: return 0.0, []
+    bot_sum = 0.0
+    total = 0.0
+    bots_found = []
+    for p in players:
+        name = p.get('name') or str(p.get('user_id'))
+        amt = float(p.get('amount') or 0)
+        total += amt
+        if USER_BET_COUNTS.get(name,0) >= BOT_FREQ_THRESHOLD:
+            bot_sum += amt
+            bots_found.append(name)
+    return safediv(bot_sum, total) if total>0 else 0.0, bots_found
+
+def kelly_fraction(p, r):
+    """Классический Kelly: f* = (p*(r)-1)/(r-1). r — множитель (коэффициент)."""
+    if r <= 1: return 0.0
+    f = (p*(r) - 1.0) / (r - 1.0)
+    # уверенно ограничим:
+    if f < 0: f = 0.0
+    if f > MAX_BANK_FRACTION: f = MAX_BANK_FRACTION
+    return f
+
+def recommend_for_bets(players, bank = 100.0):
+    """
+    Основная логика прогнозирования:
+    - считаем долю бот-сумм среди текущих ставок,
+    - по историческим данным считаем вероятность crash >= T для CHECK_COEFS,
+    - возможно скорректируем эти вероятности в зависимости от bot_fraction (консервативная коррекция),
+    - формируем safe/medium/risky: максимальный коэффициент, для которого p >= threshold (safe/medium/risky),
+    - считаем "точечный" коэффициент — к примеру коэффициент с наибольшим ожидаемым Kelly-ставкой.
+    """
+    bot_frac, bots_list = detect_bots_from_players(players)
+    # historical probs
+    probs = {c: prob_crash_ge(c) for c in CHECK_COEFS}
+
+    # корректировка вероятностей в зависимости от bot_frac.
+    # Если много ботов — считаем что риск чуть выше, уменьшаем p на небольшую величину.
+    adjust = 0.0
+    if bot_frac >= 0.6:
+        adjust = -0.09
+    elif bot_frac >= 0.3:
+        adjust = -0.05
+    elif bot_frac >= 0.15:
+        adjust = -0.02
+    # clip and apply
+    for c in probs:
+        p = probs[c] + adjust
+        if p < 0: p = 0.0
+        if p > 1: p = 1.0
+        probs[c] = p
+
+    # pick recommended coefs for each level
+    recommended = {}
+    for level, p_threshold in LEVEL_PROBS.items():
+        # найти максимальный коэффициент t where probs[t] >= p_threshold
+        opts = [c for c in CHECK_COEFS if probs.get(c,0) >= p_threshold]
+        recommended[level] = max(opts) if opts else None
+
+    # Точечный коэффициент: максимально выгодный с точки зрения Kelly (с учётом estimated p)
+    best_coef = None
+    best_kelly = 0.0
+    for c in CHECK_COEFS:
+        p = probs[c]
+        kf = kelly_fraction(p, c)
+        if kf > best_kelly:
+            best_kelly = kf
+            best_coef = c
+
+    # Рассчитать рекомендованные доли от банка для уровней (консервативно):
+    bank_fracs = {}
+    for level in ['safe','medium','risky']:
+        coef = recommended[level]
+        if coef is None:
+            bank_fracs[level] = 0.0
             continue
+        p = probs[coef]
+        f = kelly_fraction(p, coef)
+        # дополнительно склоняем в сторону консерватизма: safe *0.5, medium *0.8, risky *1.0
+        factor = {'safe': 0.5, 'medium': 0.8, 'risky': 1.0}[level]
+        bank_fracs[level] = min(MAX_BANK_FRACTION, f * factor)
+    # Точечный % от банка
+    point_bank_frac = min(MAX_BANK_FRACTION, best_kelly)
 
-    result = compute_prediction(norm_bets, bank_amount=bank_amount)
+    explanation = {
+        "total_history_games": TOTAL_GAMES,
+        "bot_fraction_in_current_bets": round(bot_frac, 3),
+        "bots_detected_example": bots_list[:10],
+        "note_on_adjust": f"Probabilities adjusted by {adjust:+.3f} due to bot_fraction"
+    }
 
-    # after prediction, we also update rolling sequences if the payload optionally includes 'last_game_color' or 'last_game_crash'
-    last_game_crash = payload.get("last_game_crash")
-    last_game_color = None
-    if last_game_crash is not None:
-        try:
-            last_game_color = color_of(float(last_game_crash))
-        except Exception:
-            last_game_color = None
-    elif payload.get("last_game_color"):
-        last_game_color = payload.get("last_game_color")
+    return {
+        "probs": {str(c): round(probs[c],3) for c in sorted(probs.keys())},
+        "recommended_coeffs": recommended,
+        "bank_fracs": {k: round(v,4) for k,v in bank_fracs.items()},
+        "point_coef": best_coef,
+        "point_bank_frac": round(point_bank_frac,4),
+        "explanation": explanation
+    }
 
-    if last_game_color:
-        # push into recent buffer and update seq_counters and crash_by_color only if payload includes last_game_crash value explicitly
-        recent_colors.append(last_game_color)
-        # optionally update seq counters for lengths
-        # We only increment sequence counters for local stats (to adapt model online)
-        for l in range(1, MAX_SEQ+1):
-            if len(recent_colors) >= l:
-                seq = tuple(list(recent_colors)[-l:])
-                seq_counters[l][seq] += 1
+# -----------------------
+# Endpoints
+# -----------------------
+@app.route('/load', methods=['POST'])
+def load_endpoint():
+    """
+    POST /load
+    body: { "url": "<http(s) or local path>" }
+    Загружает исторический JSON (массив объектов) и инициализирует память.
+    """
+    body = request.get_json(force=True)
+    if not body or 'url' not in body:
+        return jsonify({"ok": False, "error": "url required in JSON body"}), 400
+    url = body['url']
+    try:
+        arr = load_json_from_url_or_file(url)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"load failed: {str(e)}"}), 500
 
-    return jsonify(result)
+    if not isinstance(arr, list):
+        return jsonify({"ok": False, "error": "expected JSON array of game objects"}), 400
 
-@app.route("/stats", methods=["GET"])
-def stats():
-    # basic diagnostics endpoint
-    top_colors = {c: len(arr) for c, arr in crash_by_color.items()}
-    # identify top bot user_ids (by profile count)
-    bot_candidates = []
-    for uid, prof in user_profiles.items():
-        if is_bot_profile(prof):
-            bot_candidates.append({"user_id": uid, "count": prof["count"], "top_auto": top_auto_of_profile(prof)})
-    bot_candidates_sorted = sorted(bot_candidates, key=lambda x: -x["count"])[:50]
-    return jsonify({
-        "historical_games": len(games),
-        "color_counts": top_colors,
-        "top_bot_candidates": bot_candidates_sorted,
-        "recent_colors": list(recent_colors)
-    })
+    # Normalize and push into HISTORY
+    with TOTAL_LOCK:
+        HISTORY.clear()
+        for it in arr:
+            # minimal normalization: we expect keys: id/game_id, crash, color_bucket, bets[], deposit_sum, num_players
+            gid = it.get('game_id') or it.get('id') or it.get('gameId')
+            crash = None
+            try:
+                crash = float(it.get('crash')) if it.get('crash') is not None else None
+            except:
+                crash = None
+            rec = {
+                "game_id": int(gid) if gid is not None else None,
+                "crash": crash,
+                "color_bucket": it.get('color_bucket') or it.get('color') or it.get('bucket'),
+                "bets": it.get('bets') or it.get('bets_json') or [],
+                "deposit_sum": it.get('deposit_sum') or it.get('deposit') or None,
+                "num_players": it.get('num_players') or it.get('players') or None,
+                "raw": None
+            }
+            HISTORY.append(rec)
+        recalc_indexes()
+    return jsonify({"ok": True, "loaded": len(HISTORY)})
 
-# ========== Start ==========
+@app.route('/status', methods=['GET'])
+def status():
+    with TOTAL_LOCK:
+        top_bots = USER_BET_COUNTS.most_common(10)
+        seqs = most_common_color_sequences(5, window=3)
+        return jsonify({
+            "total_games": TOTAL_GAMES,
+            "last_5_crashes": CRASHES[-5:],
+            "top_bots_example": top_bots,
+            "top_color_triplets": [[list(k), v] for k,v in seqs]
+        })
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    """
+    POST /predict
+    body:
+    {
+      "players": [ { "user_id":..., "name":"...", "amount":..., "auto":... }, ... ],
+      "game_id": 6233375,
+      "bank": 100.0   # optional, для расчёта доли от банка
+    }
+    """
+    body = request.get_json(force=True)
+    if not body:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
+    players = body.get('players') or []
+    bank = float(body.get('bank', 100.0) or 100.0)
+    with TOTAL_LOCK:
+        res = recommend_for_bets(players, bank)
+    # Вернём человечески читабельный ответ на русском + структуры
+    human = {
+        "Рекомендация (safe/medium/risky)": {
+            "safe": {
+                "коэффициент": res['recommended_coeffs']['safe'],
+                "риск_в%_банка": round(100*res['bank_fracs']['safe'], 3),
+                "вероятность_успеха": None if res['recommended_coeffs']['safe'] is None else res['probs'].get(str(res['recommended_coeffs']['safe']))
+            },
+            "medium": {
+                "коэффициент": res['recommended_coeffs']['medium'],
+                "риск_в%_банка": round(100*res['bank_fracs']['medium'], 3),
+                "вероятность_успеха": None if res['recommended_coeffs']['medium'] is None else res['probs'].get(str(res['recommended_coeffs']['medium']))
+            },
+            "risky": {
+                "коэффициент": res['recommended_coeffs']['risky'],
+                "риск_в%_банка": round(100*res['bank_fracs']['risky'], 3),
+                "вероятность_успеха": None if res['recommended_coeffs']['risky'] is None else res['probs'].get(str(res['recommended_coeffs']['risky']))
+            }
+        },
+        "Точечный_коэффициент": {
+            "coef": res['point_coef'],
+            "suggested_%_of_bank": round(100*res['point_bank_frac'], 3),
+            "note": "точечный коэффициент выбрался как максимизирующий Kelly"
+        },
+        "объяснение": res['explanation'],
+        "raw_probs": res['probs']
+    }
+    return jsonify({"ok": True, "result": human})
+
+@app.route('/result', methods=['POST'])
+def result():
+    """
+    POST /result
+    body: { "game_id": 6233375, "crash": 1.52, "color_bucket": "blue", "bets": [ ... optional ... ] }
+    Добавляет результат в локальную историю и пересчитывает индексы.
+    """
+    body = request.get_json(force=True)
+    if not body or 'game_id' not in body or 'crash' not in body:
+        return jsonify({"ok": False, "error": "game_id and crash required"}), 400
+    game_id = int(body['game_id'])
+    crash = float(body['crash'])
+    cb = body.get('color_bucket')
+    bets = body.get('bets') or []
+    with TOTAL_LOCK:
+        HISTORY.append({
+            "game_id": game_id,
+            "crash": crash,
+            "color_bucket": cb,
+            "bets": bets
+        })
+        recalc_indexes()
+    return jsonify({"ok": True, "total_games": TOTAL_GAMES})
+
+# -----------------------
+# Main
+# -----------------------
 if __name__ == "__main__":
-    load_historical(HISTORICAL_FILE)
-    print("Starting AI helper on port", PORT)
-    app.run(host="0.0.0.0", port=PORT)
+    print("AI assistant starting... open /status to check")
+    # Optionally, if environment variable AUTO_LOAD_URL present, try loading
+    import os
+    auto = os.environ.get('AUTO_LOAD_URL')
+    if auto:
+        try:
+            print("Auto-loading", auto)
+            arr = load_json_from_url_or_file(auto)
+            if isinstance(arr, list):
+                with TOTAL_LOCK:
+                    HISTORY.clear()
+                    for it in arr:
+                        gid = it.get('game_id') or it.get('id') or it.get('gameId')
+                        try:
+                            crash = float(it.get('crash')) if it.get('crash') is not None else None
+                        except:
+                            crash = None
+                        HISTORY.append({
+                            "game_id": int(gid) if gid is not None else None,
+                            "crash": crash,
+                            "color_bucket": it.get('color_bucket') or it.get('color'),
+                            "bets": it.get('bets') or []
+                        })
+                    recalc_indexes()
+                    print("Loaded", len(HISTORY), "games")
+        except Exception as e:
+            print("Auto-load failed:", e)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 3001)))
