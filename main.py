@@ -6,6 +6,8 @@ import threading
 import time
 import requests
 from model import AIAssistant
+from mega import Mega
+import json
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant")
@@ -16,6 +18,41 @@ SELF_URL = os.getenv("SELF_URL")
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
 
+# ======== Mega загрузка файла =========
+MEGA_EMAIL = os.getenv("MEGA_EMAIL")
+MEGA_PASSWORD = os.getenv("MEGA_PASSWORD")
+MEGA_FOLDER = "crashAi_backup"
+MEGA_FILE = "crash_23k.json"
+
+def load_history_from_mega():
+    try:
+        mega = Mega()
+        m = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
+        logger.info("Вход в Mega успешен")
+        file = m.find(MEGA_FILE)
+        if not file:
+            logger.warning(f"Файл {MEGA_FILE} не найден в Mega")
+            return
+        local_path = MEGA_FILE
+        logger.info(f"Скачиваем {MEGA_FILE} с Mega...")
+        m.download(file, dest_filename=local_path)
+        logger.info("Файл скачан, начинаем обработку")
+        # Загружаем и обрабатываем игры блоками по 5000 для экономии RAM
+        with open(local_path, "r") as f:
+            data = json.load(f)
+            block_size = 5000
+            for i in range(0, len(data), block_size):
+                block = data[i:i+block_size]
+                assistant.load_history_from_list(block)
+                logger.info(f"Загружен блок {i}-{i+len(block)} игр")
+        logger.info("История игр полностью загружена из Mega")
+    except Exception as e:
+        logger.exception(f"Ошибка загрузки истории из Mega: {e}")
+
+# Запускаем в отдельном потоке, чтобы не блокировать API
+threading.Thread(target=load_history_from_mega, daemon=True).start()
+
+# ======== KEEP-ALIVE =========
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
@@ -30,6 +67,7 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
+# ===== Pydantic Models =====
 class BetsPayload(BaseModel):
     game_id: int
     bets: list
@@ -47,6 +85,7 @@ class FeedbackPayload(BaseModel):
 class LoadGamesPayload(BaseModel):
     url: str
 
+# ===== ENDPOINTS =====
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
@@ -85,31 +124,6 @@ async def feedback(payload: FeedbackPayload):
 async def healthz():
     return {"status": "ok"}
 
-@app.post("/load_games")
-async def load_games(payload: LoadGamesPayload):
-    try:
-        resp = requests.get(payload.url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        for game in data:
-            if "bets" in game and isinstance(game["bets"], str):
-                try:
-                    import json
-                    game["bets"] = json.loads(game["bets"])
-                except Exception as e:
-                    logger.warning(f"Не удалось распарсить bets для game_id {game.get('game_id')}: {e}")
-                    game["bets"] = []
-        assistant.load_history_from_list(data)
-        logger.info(f"Игры загружены! Всего в истории: {assistant.history_df.shape[0]}")
-        return {"status": "ok", "games_loaded": assistant.history_df.shape[0]}
-    except Exception as e:
-        logger.exception("Ошибка при загрузке игр")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.get("/logs")
 async def get_logs(limit: int = 20):
     return {"logs": assistant.get_pred_log(limit)}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
