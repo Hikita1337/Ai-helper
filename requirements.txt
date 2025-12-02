@@ -3,4 +3,4 @@ pandas==2.2.3 --only-binary :all:
 fastapi==0.95.2
 uvicorn[standard]==0.22.0
 requests==2.32.5
-pydantic==2.6.2
+pydantic==1.10.13
