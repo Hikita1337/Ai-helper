@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import os
@@ -14,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("ai_assistant")
 
 PORT = int(os.getenv("PORT", 8000))
-SELF_URL = os.getenv("SELF_URL")  # для keep-alive
+SELF_URL = os.getenv("SELF_URL")
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
 
@@ -39,7 +38,7 @@ class BetsPayload(BaseModel):
     num_players: int | None = None
     deposit_sum: float | None = None
     bets: list
-    meta: dict | None = {}
+    meta: dict | None = None
 
 class FeedbackPayload(BaseModel):
     game_id: int
@@ -52,7 +51,7 @@ class LoadGamesPayload(BaseModel):
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
-        assistant.predict_and_log(payload.dict())
+        assistant.predict_and_log(payload.model_dump())
         return
     except Exception as e:
         logger.exception("Ошибка в /predict")
@@ -71,7 +70,6 @@ async def feedback(payload: FeedbackPayload):
 async def healthz():
     return {"status": "ok"}
 
-# ===== Новый эндпоинт для загрузки игр через ссылку =====
 @app.post("/load_games")
 async def load_games(payload: LoadGamesPayload):
     try:
@@ -79,7 +77,6 @@ async def load_games(payload: LoadGamesPayload):
         resp.raise_for_status()
         data = resp.json()
 
-        # Приведение bets к списку словарей
         for game in data:
             if "bets" in game and isinstance(game["bets"], str):
                 try:
