@@ -9,4 +9,4 @@ lightgbm==4.6.0
 mega.py>=1.0.0,<2
 tenacity>=8.2.2
 ably==1.2.0
-pycryptodome>=3.17
+pycryptodome>=3.18.0
