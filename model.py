@@ -1,13 +1,10 @@
-# model.py
 import numpy as np
 import pandas as pd
 import json
 import logging
-import requests
 from collections import Counter
 
 logger = logging.getLogger("ai_assistant.model")
-
 
 class AIAssistant:
     def __init__(self):
@@ -16,6 +13,7 @@ class AIAssistant:
         self.crash_values = []
         self.color_counts = Counter()
         self.games_index = set()
+        self.last_logs = []  # лог предсказаний + фактический краш
 
     # -------------------- Загрузка истории --------------------
     def load_history(self, path):
@@ -41,7 +39,8 @@ class AIAssistant:
                 "bets": bets,
                 "deposit_sum": deposit_sum,
                 "num_players": num_players,
-                "color_bucket": bucket
+                "color_bucket": bucket,
+                "fast_game": False
             })
             for b in bets:
                 uid = b.get("user_id")
@@ -52,15 +51,6 @@ class AIAssistant:
                 self.color_counts[bucket] += 1
         self.history_df = pd.DataFrame(rows)
         logger.info(f"Loaded {len(self.history_df)} games; unique users: {len(self.user_counts)}")
-
-    # -------------------- Новый метод: загрузка с URL --------------------
-    def load_history_from_url(self, url):
-        logger.info(f"Скачиваю данные с {url}")
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        self.load_history_from_list(data)
-        logger.info(f"История загружена! Всего игр: {len(self.history_df)}")
 
     def history_count(self):
         return len(self.history_df)
@@ -144,42 +134,57 @@ class AIAssistant:
 
         color_probs = self.estimate_color_probs()
 
-        logger.info(f"=== PREDICT (game {game_id}) ===")
-        logger.info(f"Игроков в снимке: {len(bets)}; суммарно: {total:.4f}; avg_auto: {avg_auto:.2f}")
-        logger.info(f"Доля денег от ботов: {bot_frac_money:.3f}; обнаружено bot_ids: {len(bot_ids)}")
-        logger.info(f"Рекомендации (confidence {confidence}%): безопасный:{safe}, средний:{med}, рисковый:{risk}, точный:{point}")
-        logger.info(f"Рекомендуемый % от банка: безопасно:{rec_safe_pct}%, средне:{rec_med_pct}%, риск:{rec_risk_pct}%")
-        logger.info(f"Цветовые вероятности: {color_probs}")
-        logger.info(f"Исторический объём игр: {len(self.crash_values)}")
-        logger.info(f"=== END PREDICT (game {game_id}) in {time.time()-start:.3f}s ===")
+        # Лог предсказаний
+        log_entry = {
+            "game_id": game_id,
+            "safe": safe,
+            "med": med,
+            "risk": risk,
+            "point": point,
+            "confidence": confidence,
+            "color_probs": color_probs,
+            "fast_game": False,
+            "crash": None
+        }
+        self.last_logs.append(log_entry)
+        if len(self.last_logs) > 100:
+            self.last_logs = self.last_logs[-100:]
 
-def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False):
-    # Обновляем историю и веса всегда
-    self.games_index.add(game_id)
-    self.crash_values.append(float(crash))
-    row = {
-        "game_id": game_id,
-        "crash": float(crash),
-        "bets": bets or [],
-        "deposit_sum": deposit_sum,
-        "num_players": num_players,
-        "color_bucket": None,
-        "fast_game": fast_game
-    }
+        logger.info(f"=== PREDICT (game {game_id}) in {time.time()-start:.3f}s ===")
 
-    # Обновляем статистику пользователей
-    for b in row["bets"]:
-        uid = b.get("user_id")
-        if uid is not None:
-            self.user_counts[uid] += 1
+    # -------------------- Feedback --------------------
+    def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False):
+        self.games_index.add(game_id)
+        self.crash_values.append(float(crash))
+        row = {
+            "game_id": game_id,
+            "crash": float(crash),
+            "bets": bets or [],
+            "deposit_sum": deposit_sum,
+            "num_players": num_players,
+            "color_bucket": None,
+            "fast_game": fast_game
+        }
 
-    self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
+        # Обновляем статистику пользователей
+        for b in row["bets"]:
+            uid = b.get("user_id")
+            if uid is not None:
+                self.user_counts[uid] += 1
 
-    if fast_game:
-        logger.info(f"Быстрая игра {game_id} обработана без визуального предикта")
-    else:
-        logger.info(f"Feedback: добавлена игра {game_id}, crash={crash}. Всего игр: {len(self.crash_values)}")
+        self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
 
+        # Обновляем лог последнего предсказания, если оно было
+        if self.last_logs and self.last_logs[-1]["game_id"] == game_id:
+            self.last_logs[-1]["crash"] = crash
+            self.last_logs[-1]["fast_game"] = fast_game
+
+        if fast_game:
+            logger.info(f"Быстрая игра {game_id} обработана без визуального предикта")
+        else:
+            logger.info(f"Feedback: добавлена игра {game_id}, crash={crash}. Всего игр: {len(self.crash_values)}")
+
+    # -------------------- Color probabilities --------------------
     def estimate_color_probs(self):
         if not self.crash_values:
             return {}
