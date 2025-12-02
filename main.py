@@ -7,7 +7,7 @@ import time
 import requests
 import json
 from ably import AblyRest
-from mega import Mega
+from mega_lite import Mega
 from model import AIAssistant
 
 
