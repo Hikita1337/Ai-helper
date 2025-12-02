@@ -6,7 +6,8 @@ import logging
 import threading
 import time
 import requests
-import numpy as np  # не забудь добавить в requirements
+import numpy as np
+import json
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -77,9 +78,20 @@ async def load_games(payload: LoadGamesPayload):
         resp = requests.get(payload.url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
+
+        # Приведение bets к списку словарей
+        for game in data:
+            if "bets" in game and isinstance(game["bets"], str):
+                try:
+                    game["bets"] = json.loads(game["bets"])
+                except Exception as e:
+                    logger.warning(f"Не удалось распарсить bets для game_id {game.get('game_id')}: {e}")
+                    game["bets"] = []
+
         assistant.load_history_from_list(data)
         logger.info(f"Игры загружены! Всего в истории: {assistant.history_count()}")
         return {"status": "ok", "games_loaded": assistant.history_count()}
+
     except Exception as e:
         logger.exception("Ошибка при загрузке игр")
         raise HTTPException(status_code=500, detail=str(e))
