@@ -6,20 +6,25 @@ import threading
 import time
 import requests
 import json
+from ably import AblyRest
 from mega import Mega
 from model import AIAssistant
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
 
 PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
+ABLY_API_KEY = os.getenv("ABLY_API_KEY")
 
 MEGA_EMAIL = os.getenv("MEGA_EMAIL")
 MEGA_PASSWORD = os.getenv("MEGA_PASSWORD")
 MEGA_FOLDER = "crashAi_backup"
 
 assistant = AIAssistant()
+ably_client = AblyRest(ABLY_API_KEY)
+ably_channel = ably_client.channels.get("crash_ai_hud")
 
 mega = Mega()
 m = None
@@ -169,8 +174,23 @@ class FeedbackPayload(BaseModel):
 @app.post("/predict")
 async def predict(payload: BetsPayload):
     try:
+        # Рассчёт предикта
         assistant.predict_and_log(payload.model_dump())
+
+        # Берём последний предикт для HUD
+        last_pred = assistant.pred_log[-1] if assistant.pred_log else None
+        if last_pred:
+            hud_data = {
+                "game_id": last_pred["game_id"],
+                "safe": last_pred["safe"],
+                "med": last_pred["med"],
+                "risk": last_pred["risk"],
+                "recommended_pct": last_pred["recommended_pct"]
+            }
+            ably_channel.publish("prediction", hud_data)
+
         return {"status": "ok"}
+
     except Exception as e:
         raise HTTPException(500, str(e))
 
