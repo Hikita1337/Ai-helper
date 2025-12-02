@@ -3,36 +3,47 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import os
 import logging
-from model import AIAssistant, load_json_from_url
+import threading
+import time
+import requests
+from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant")
 
-DATA_FILE = os.getenv("GAMES_FILE", "")  # локальный файл JSON
-GAMES_FILE_URL = os.getenv("GAMES_FILE_URL", "")  # ссылка на JSON с Google Drive
+# Настройки через переменные среды
+DATA_FILE = os.getenv("GAMES_FILE", "")  # путь к JSON с историей
 PERSIST_ON_UPDATE = os.getenv("PERSIST_ON_UPDATE", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 8000))
+SELF_URL = os.getenv("SELF_URL")  # сюда укажи URL своего Render-сервера, например: https://my-app.onrender.com
 
 app = FastAPI(title="Crash AI Assistant")
-
 assistant = AIAssistant()
 
-# Загружаем историю
 if DATA_FILE:
     try:
         assistant.load_history(DATA_FILE)
         logger.info(f"История загружена из {DATA_FILE} (игр: {assistant.history_count()})")
     except Exception as e:
         logger.warning(f"Не удалось загрузить {DATA_FILE}: {e}")
-elif GAMES_FILE_URL:
-    try:
-        games_list = load_json_from_url(GAMES_FILE_URL)
-        assistant.load_history_from_list(games_list)
-        logger.info(f"История загружена с URL {GAMES_FILE_URL} (игр: {assistant.history_count()})")
-    except Exception as e:
-        logger.warning(f"Не удалось загрузить историю с URL: {e}")
 
-# -------------------- Pydantic модели --------------------
+# ===== Keep-alive поток =====
+def keep_alive():
+    if not SELF_URL:
+        logger.warning("SELF_URL не задан, keep-alive не будет работать")
+        return
+    while True:
+        try:
+            resp = requests.get(f"{SELF_URL}/healthz", timeout=5)
+            logger.info(f"Keep-alive ping OK: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Keep-alive error: {e}")
+        # случайная пауза 4–6 минут
+        time.sleep(240 + 120 * np.random.rand())
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
+# ===== Модели для API =====
 class BetsPayload(BaseModel):
     game_id: int
     num_players: int | None = None
@@ -44,7 +55,6 @@ class FeedbackPayload(BaseModel):
     game_id: int
     crash: float
 
-# -------------------- Endpoints --------------------
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
