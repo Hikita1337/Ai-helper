@@ -208,7 +208,7 @@ class AIAssistant:
         return np.array(base + bot_feats + color_feats, dtype=float)
 
     # -------------------- Предикт и логирование --------------------
-    def predict_and_log(self, payload):
+def predict_and_log(self, payload):
     t0 = time.time()
     game_id = payload.get("game_id")
     bets = payload.get("bets") or []
@@ -225,7 +225,7 @@ class AIAssistant:
     bot_frac, _ = self.detect_bots_in_snapshot(bets)
     recommended_pct = max(0.5, 2.0*(1 - bot_frac))
 
-    # ---------------- Цветовой прогноз и уверенность ----------------
+    # Цветовой прогноз
     if self.color_sequence:
         color_counts = Counter(self.color_sequence)
         predicted_color, count = color_counts.most_common(1)[0]
@@ -234,7 +234,7 @@ class AIAssistant:
         predicted_color = "unknown"
         color_confidence = 0.0
 
-    # ---------------- Запись в лог ----------------
+    # Запись в лог
     self.pred_log.append({
         "game_id": game_id,
         "safe": round(safe,2),
@@ -250,7 +250,6 @@ class AIAssistant:
     })
 
     logger.info(f"PREDICT game={game_id} safe={safe} med={med} risk={risk} in {time.time()-t0:.3f}s")
-
     
     def get_pred_log(self, limit=20):
         return list(self.pred_log)[-limit:]
