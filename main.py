@@ -6,40 +6,44 @@ import logging
 import threading
 import time
 import requests
-import numpy as np  # добавляем, чтобы keep_alive работал
+import gdown  # добавляем gdown для скачки с Google Drive
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant")
 
 # Настройки через переменные среды
-DATA_FILE = os.getenv("GAMES_FILE", "")  # путь к JSON с историей
+GAMES_FILE_URL = os.getenv("GAMES_FILE", "")  # ссылка на JSON на Google Drive
 PERSIST_ON_UPDATE = os.getenv("PERSIST_ON_UPDATE", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 8000))
-SELF_URL = os.getenv("SELF_URL")  # URL своего Render-сервера
+SELF_URL = os.getenv("SELF_URL")
 
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
 
-if DATA_FILE:
+# ===== Загрузка истории =====
+if GAMES_FILE_URL:
     try:
-        assistant.load_history(DATA_FILE)
-        logger.info(f"История загружена из {DATA_FILE} (игр: {assistant.history_count()})")
+        local_file = "games.json"
+        logger.info(f"Скачиваем историю с Google Drive: {GAMES_FILE_URL}")
+        gdown.download(GAMES_FILE_URL, local_file, quiet=False)
+        assistant.load_history(local_file)
+        logger.info(f"История загружена из {local_file} (игр: {assistant.history_count()})")
     except Exception as e:
-        logger.warning(f"Не удалось загрузить {DATA_FILE}: {e}")
+        logger.warning(f"Не удалось загрузить историю: {e}")
 
 # ===== Keep-alive поток =====
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
         return
+    import numpy as np  # np нужен для генерации случайной задержки
     while True:
         try:
             resp = requests.get(f"{SELF_URL}/healthz", timeout=5)
             logger.info(f"Keep-alive ping OK: {resp.status_code}")
         except Exception as e:
             logger.warning(f"Keep-alive error: {e}")
-        # случайная пауза 4–6 минут
         time.sleep(240 + 120 * np.random.rand())
 
 threading.Thread(target=keep_alive, daemon=True).start()
@@ -56,7 +60,6 @@ class FeedbackPayload(BaseModel):
     game_id: int
     crash: float
 
-# ===== Роуты =====
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
@@ -77,10 +80,3 @@ async def feedback(payload: FeedbackPayload):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
-
-@app.get("/")
-async def root():
-    # логируем количество загруженных игр
-    count = assistant.history_count()
-    logger.info(f"GET / — всего загружено игр: {count}")
-    return {"message": f"AI Assistant is running — загружено игр: {count}"}
