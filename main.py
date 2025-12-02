@@ -6,38 +6,22 @@ import logging
 import threading
 import time
 import requests
-import gdown  # добавляем gdown для скачки с Google Drive
+import numpy as np  # не забудь добавить в requirements
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant")
 
-# Настройки через переменные среды
-GAMES_FILE_URL = os.getenv("GAMES_FILE", "")  # ссылка на JSON на Google Drive
-PERSIST_ON_UPDATE = os.getenv("PERSIST_ON_UPDATE", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 8000))
-SELF_URL = os.getenv("SELF_URL")
-
+SELF_URL = os.getenv("SELF_URL")  # для keep-alive
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
-
-# ===== Загрузка истории =====
-if GAMES_FILE_URL:
-    try:
-        local_file = "games.json"
-        logger.info(f"Скачиваем историю с Google Drive: {GAMES_FILE_URL}")
-        gdown.download(GAMES_FILE_URL, local_file, quiet=False)
-        assistant.load_history(local_file)
-        logger.info(f"История загружена из {local_file} (игр: {assistant.history_count()})")
-    except Exception as e:
-        logger.warning(f"Не удалось загрузить историю: {e}")
 
 # ===== Keep-alive поток =====
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
         return
-    import numpy as np  # np нужен для генерации случайной задержки
     while True:
         try:
             resp = requests.get(f"{SELF_URL}/healthz", timeout=5)
@@ -60,10 +44,15 @@ class FeedbackPayload(BaseModel):
     game_id: int
     crash: float
 
+class LoadGamesPayload(BaseModel):
+    url: str
+
+# ===== Эндпоинты =====
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
         assistant.predict_and_log(payload.dict())
+        return
     except Exception as e:
         logger.exception("Ошибка в /predict")
         raise HTTPException(status_code=500, detail=str(e))
@@ -71,7 +60,7 @@ async def predict(payload: BetsPayload, request: Request):
 @app.post("/feedback")
 async def feedback(payload: FeedbackPayload):
     try:
-        assistant.process_feedback(payload.game_id, payload.crash, persist=PERSIST_ON_UPDATE)
+        assistant.process_feedback(payload.game_id, payload.crash)
         return {"status": "ok"}
     except Exception as e:
         logger.exception("Ошибка в /feedback")
@@ -80,3 +69,17 @@ async def feedback(payload: FeedbackPayload):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+# ===== Новый эндпоинт для загрузки игр через ссылку =====
+@app.post("/load_games")
+async def load_games(payload: LoadGamesPayload):
+    try:
+        resp = requests.get(payload.url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        assistant.load_history_from_data(data)
+        logger.info(f"Игры загружены! Всего в истории: {assistant.history_count()}")
+        return {"status": "ok", "games_loaded": assistant.history_count()}
+    except Exception as e:
+        logger.exception("Ошибка при загрузке игр")
+        raise HTTPException(status_code=500, detail=str(e))
