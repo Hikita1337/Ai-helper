@@ -1,4 +1,3 @@
-#main.py
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import os
@@ -7,7 +6,6 @@ import threading
 import time
 import requests
 import numpy as np
-import json
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -66,8 +64,6 @@ async def predict(payload: BetsPayload, request: Request):
 async def feedback(payload: FeedbackPayload):
     try:
         fast_game = False
-
-        # Быстрая игра: пришли ставки + краш одновременно
         if payload.bets and payload.crash:
             fast_game = True
 
@@ -116,6 +112,13 @@ async def load_games(payload: LoadGamesPayload):
     except Exception as e:
         logger.exception("Ошибка при загрузке игр")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/logs")
+async def get_logs(limit: int = 20):
+    """
+    Отдает последние предсказания с фактическими крашами и fast_game флагом
+    """
+    return {"logs": assistant.last_logs[-limit:]}
 
 # ===== RUN =====
 if __name__ == "__main__":
