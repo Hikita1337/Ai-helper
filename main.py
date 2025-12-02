@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 import requests
-import numpy as np
+import numpy as np  # добавляем, чтобы keep_alive работал
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -16,7 +16,7 @@ logger = logging.getLogger("ai_assistant")
 DATA_FILE = os.getenv("GAMES_FILE", "")  # путь к JSON с историей
 PERSIST_ON_UPDATE = os.getenv("PERSIST_ON_UPDATE", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 8000))
-SELF_URL = os.getenv("SELF_URL")  # URL Render-сервера
+SELF_URL = os.getenv("SELF_URL")  # URL своего Render-сервера
 
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
@@ -24,15 +24,11 @@ assistant = AIAssistant()
 if DATA_FILE:
     try:
         assistant.load_history(DATA_FILE)
-        count = assistant.history_count()
-        logger.info(f"История загружена из {DATA_FILE} (игр: {count})")
-        # Логим конкретное сообщение, если игр много
-        if count >= 23000:
-            logger.info(f"🔥 Внимание: загружено {count} игр")
+        logger.info(f"История загружена из {DATA_FILE} (игр: {assistant.history_count()})")
     except Exception as e:
         logger.warning(f"Не удалось загрузить {DATA_FILE}: {e}")
 
-# ===== Keep-alive поток (бесшумный) =====
+# ===== Keep-alive поток =====
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
@@ -40,14 +36,13 @@ def keep_alive():
     while True:
         try:
             resp = requests.get(f"{SELF_URL}/healthz", timeout=5)
-            logger.debug(f"Keep-alive ping OK: {resp.status_code}")  # debug вместо info
+            logger.info(f"Keep-alive ping OK: {resp.status_code}")
         except Exception as e:
             logger.warning(f"Keep-alive error: {e}")
         # случайная пауза 4–6 минут
         time.sleep(240 + 120 * np.random.rand())
 
-# Запускаем поток без блокировки основного приложения
-threading.Thread(target=keep_alive, daemon=True, name="KeepAliveThread").start()
+threading.Thread(target=keep_alive, daemon=True).start()
 
 # ===== Модели для API =====
 class BetsPayload(BaseModel):
@@ -61,11 +56,11 @@ class FeedbackPayload(BaseModel):
     game_id: int
     crash: float
 
+# ===== Роуты =====
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
         assistant.predict_and_log(payload.dict())
-        return
     except Exception as e:
         logger.exception("Ошибка в /predict")
         raise HTTPException(status_code=500, detail=str(e))
@@ -82,3 +77,10 @@ async def feedback(payload: FeedbackPayload):
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+@app.get("/")
+async def root():
+    # логируем количество загруженных игр
+    count = assistant.history_count()
+    logger.info(f"GET / — всего загружено игр: {count}")
+    return {"message": f"AI Assistant is running — загружено игр: {count}"}
