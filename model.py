@@ -6,6 +6,7 @@ from lightgbm import LGBMRegressor
 
 logger = logging.getLogger("ai_assistant.model")
 
+
 class AIAssistant:
     def __init__(self):
         self.history_df = pd.DataFrame()
@@ -15,11 +16,9 @@ class AIAssistant:
         self.color_counts = Counter()
         self.bot_patterns = {}  # uid -> история ставок
         self.pred_log = deque(maxlen=1000)  # лог предиктов
-
         self.model_safe = LGBMRegressor()
         self.model_med = LGBMRegressor()
         self.model_risk = LGBMRegressor()
-
         self.pending_feedback = []
 
     # -------------------- Загрузка истории --------------------
@@ -80,7 +79,7 @@ class AIAssistant:
         frac_amount = (bot_amount / total_amount) if total_amount > 0 else 0.0
         return frac_amount, bot_ids
 
-    # -------------------- Предикт --------------------
+    # -------------------- Основной предикт --------------------
     def predict_and_log(self, payload):
         import time
         start = time.time()
@@ -91,7 +90,6 @@ class AIAssistant:
         total_bets = sum(float(b.get("amount") or 0) for b in bets)
         num_bets = len(bets)
         avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
-
         features = np.array([[bot_frac_money, num_bets, total_bets, avg_auto]])
 
         try:
@@ -124,7 +122,6 @@ class AIAssistant:
     def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False):
         self.games_index.add(game_id)
         self.crash_values.append(float(crash))
-
         row = {
             "game_id": game_id,
             "crash": float(crash),
@@ -147,8 +144,8 @@ class AIAssistant:
                 })
 
         self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
-
         self.pending_feedback.append(row)
+
         if len(self.pending_feedback) >= 50:
             self._online_train()
             self.pending_feedback.clear()
@@ -162,12 +159,7 @@ class AIAssistant:
     def _online_train(self):
         if len(self.history_df) < 50:
             return
-
-        features = []
-        safe_targets = []
-        med_targets = []
-        risk_targets = []
-
+        features, safe_targets, med_targets, risk_targets = [], [], [], []
         for row in self.history_df[-50:].itertuples():
             bets = row.bets or []
             bot_frac, _ = self.detect_bots_in_snapshot(bets)
@@ -183,7 +175,6 @@ class AIAssistant:
         self.model_safe.fit(X, np.array(safe_targets))
         self.model_med.fit(X, np.array(med_targets))
         self.model_risk.fit(X, np.array(risk_targets))
-
         logger.info("Online training completed for last 50 games.")
 
     # -------------------- Анализ цветов --------------------
