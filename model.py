@@ -4,7 +4,6 @@ import pandas as pd
 import json
 import logging
 import requests
-import time
 from collections import Counter
 
 logger = logging.getLogger("ai_assistant.model")
@@ -53,17 +52,19 @@ class AIAssistant:
         self.history_df = pd.DataFrame(rows)
         logger.info(f"Loaded {len(self.history_df)} games; unique users: {len(self.user_counts)}")
 
+    # -------------------- Новый метод: загрузка с URL --------------------
+    def load_history_from_url(self, url):
+        logger.info(f"Скачиваю данные с {url}")
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        self.load_history_from_list(data)
+        logger.info(f"История загружена! Всего игр: {len(self.history_df)}")
+
     def history_count(self):
         return len(self.history_df)
 
-    # -------------------- Подгрузка с URL --------------------
-def load_json_from_url(url):
-    logger.info(f"Скачиваю данные с {url}")
-    resp = requests.get(url)
-    resp.raise_for_status()
-    return resp.json()
-
-# -------------------- Детекция ботов --------------------
+    # -------------------- Детекция ботов --------------------
     def detect_bots_in_snapshot(self, bets):
         if not bets:
             return 0.0, []
@@ -83,7 +84,7 @@ def load_json_from_url(url):
         frac_amount = (bot_amount / total_amount) if total_amount > 0 else 0.0
         return frac_amount, bot_ids
 
-# -------------------- Основной прогноз --------------------
+    # -------------------- Основной прогноз --------------------
     def _crash_percentiles(self, tail=None):
         if not self.crash_values:
             return {}
@@ -101,6 +102,7 @@ def load_json_from_url(url):
         }
 
     def predict_and_log(self, payload):
+        import time
         start = time.time()
         game_id = payload.get("game_id")
         bets = payload.get("bets", [])
@@ -150,7 +152,7 @@ def load_json_from_url(url):
         logger.info(f"Исторический объём игр: {len(self.crash_values)}")
         logger.info(f"=== END PREDICT (game {game_id}) in {time.time()-start:.3f}s ===")
 
-    def process_feedback(self, game_id, crash, persist=False, bets=None, deposit_sum=None, num_players=None):
+    def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None):
         if game_id in self.games_index:
             logger.info(f"Feedback: игра {game_id} уже в истории — обновляю.")
         self.games_index.add(game_id)
@@ -169,22 +171,6 @@ def load_json_from_url(url):
                 self.user_counts[uid] += 1
         self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
         logger.info(f"Feedback: добавлена игра {game_id}, crash={crash}. Всего игр: {len(self.crash_values)}")
-        if persist:
-            self._persist_history("history_updated.json")
-
-    def _persist_history(self, path):
-        with open(path, "w", encoding="utf-8") as f:
-            for _, row in self.history_df.iterrows():
-                obj = {
-                    "game_id": int(row["game_id"]),
-                    "crash": float(row["crash"]),
-                    "bets": row["bets"],
-                    "deposit_sum": row.get("deposit_sum"),
-                    "num_players": row.get("num_players"),
-                    "color_bucket": row.get("color_bucket")
-                }
-                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        logger.info(f"Persisted history to {path}")
 
     def estimate_color_probs(self):
         if not self.crash_values:
