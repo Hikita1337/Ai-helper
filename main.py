@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import os
@@ -65,14 +64,27 @@ async def predict(payload: BetsPayload, request: Request):
 @app.post("/feedback")
 async def feedback(payload: FeedbackPayload):
     try:
+        fast_game = False
+
+        # Быстрая игра: пришли ставки + краш одновременно
+        if payload.bets and payload.crash:
+            fast_game = True
+
         assistant.process_feedback(
             game_id=payload.game_id,
             crash=payload.crash,
             bets=payload.bets,
             deposit_sum=payload.deposit_sum,
             num_players=payload.num_players,
+            fast_game=fast_game
         )
+
+        if fast_game:
+            logger.info(f"Быстрая игра {payload.game_id}, визуальный предикт пропущен")
+            return {"status": "ok", "fast_game": True}
+
         return {"status": "ok"}
+
     except Exception as e:
         logger.exception("Ошибка в /feedback")
         raise HTTPException(status_code=500, detail=str(e))
