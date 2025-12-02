@@ -209,36 +209,48 @@ class AIAssistant:
 
     # -------------------- Предикт и логирование --------------------
     def predict_and_log(self, payload):
-        t0 = time.time()
-        game_id = payload.get("game_id")
-        bets = payload.get("bets") or []
-        fast_game = payload.get("meta", {}).get("fast_game", False)
+    t0 = time.time()
+    game_id = payload.get("game_id")
+    bets = payload.get("bets") or []
+    fast_game = payload.get("meta", {}).get("fast_game", False)
 
-        X = self._make_features_for_game(bets).reshape(1,-1)
-        try:
-            safe = float(self.model_safe.predict(X))
-            med = float(self.model_med.predict(X))
-            risk = float(self.model_risk.predict(X))
-        except Exception:
-            safe, med, risk = 1.2, 1.5, 2.0
+    X = self._make_features_for_game(bets).reshape(1,-1)
+    try:
+        safe = float(self.model_safe.predict(X))
+        med = float(self.model_med.predict(X))
+        risk = float(self.model_risk.predict(X))
+    except Exception:
+        safe, med, risk = 1.2, 1.5, 2.0
 
-        bot_frac, _ = self.detect_bots_in_snapshot(bets)
-        recommended_pct = max(0.5, 2.0*(1 - bot_frac))
+    bot_frac, _ = self.detect_bots_in_snapshot(bets)
+    recommended_pct = max(0.5, 2.0*(1 - bot_frac))
 
-        self.pred_log.append({
-            "game_id": game_id,
-            "safe": round(safe,2),
-            "med": round(med,2),
-            "risk": round(risk,2),
-            "recommended_pct": round(recommended_pct,2),
-            "bot_frac_money": round(bot_frac,3),
-            "num_bets": len(bets),
-            "timestamp": time.time(),
-            "fast_game": bool(fast_game)
-        })
+    # ---------------- Цветовой прогноз и уверенность ----------------
+    if self.color_sequence:
+        color_counts = Counter(self.color_sequence)
+        predicted_color, count = color_counts.most_common(1)[0]
+        color_confidence = count / sum(color_counts.values())
+    else:
+        predicted_color = "unknown"
+        color_confidence = 0.0
 
-        logger.info(f"PREDICT game={game_id} safe={safe} med={med} risk={risk} in {time.time()-t0:.3f}s")
+    # ---------------- Запись в лог ----------------
+    self.pred_log.append({
+        "game_id": game_id,
+        "safe": round(safe,2),
+        "med": round(med,2),
+        "risk": round(risk,2),
+        "recommended_pct": round(recommended_pct,2),
+        "bot_frac_money": round(bot_frac,3),
+        "num_bets": len(bets),
+        "timestamp": time.time(),
+        "fast_game": bool(fast_game),
+        "predicted_color": predicted_color,          
+        "color_confidence": round(color_confidence,3)
+    })
 
+    logger.info(f"PREDICT game={game_id} safe={safe} med={med} risk={risk} in {time.time()-t0:.3f}s")
+    
     def get_pred_log(self, limit=20):
         return list(self.pred_log)[-limit:]
 
