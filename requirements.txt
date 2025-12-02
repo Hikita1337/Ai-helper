@@ -5,6 +5,7 @@ numpy==2.3.5
 pandas==2.2.3
 requests==2.32.5
 python-dotenv==1.2.1
-lightgbm==4.6.0          # последняя версия, поддерживает Python 3.13
-mega.py>=1.0.0,<2        # последняя совместимая версия mega.py
-ably==1.2.0              # если используешь Ably
+lightgbm==4.6.0
+mega.py>=1.0.0,<2
+tenacity>=8.2.2
+ably==1.2.0 
