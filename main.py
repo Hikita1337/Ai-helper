@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import os
@@ -12,12 +13,14 @@ from model import AIAssistant
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant")
 
+# ===== CONFIG =====
 PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
+
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
 
-# ===== Keep-alive поток =====
+# ===== KEEP-ALIVE =====
 def keep_alive():
     if not SELF_URL:
         logger.warning("SELF_URL не задан, keep-alive не будет работать")
@@ -32,27 +35,29 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# ===== Модели для API =====
+# ===== Pydantic Models =====
 class BetsPayload(BaseModel):
     game_id: int
+    bets: list
     num_players: int | None = None
     deposit_sum: float | None = None
-    bets: list
     meta: dict | None = None
 
 class FeedbackPayload(BaseModel):
     game_id: int
     crash: float
+    bets: list | None = None
+    deposit_sum: float | None = None
+    num_players: int | None = None
 
 class LoadGamesPayload(BaseModel):
     url: str
 
-# ===== Эндпоинты =====
+# ===== ENDPOINTS =====
 @app.post("/predict", status_code=204)
 async def predict(payload: BetsPayload, request: Request):
     try:
         assistant.predict_and_log(payload.model_dump())
-        return
     except Exception as e:
         logger.exception("Ошибка в /predict")
         raise HTTPException(status_code=500, detail=str(e))
@@ -60,7 +65,13 @@ async def predict(payload: BetsPayload, request: Request):
 @app.post("/feedback")
 async def feedback(payload: FeedbackPayload):
     try:
-        assistant.process_feedback(payload.game_id, payload.crash)
+        assistant.process_feedback(
+            game_id=payload.game_id,
+            crash=payload.crash,
+            bets=payload.bets,
+            deposit_sum=payload.deposit_sum,
+            num_players=payload.num_players,
+        )
         return {"status": "ok"}
     except Exception as e:
         logger.exception("Ошибка в /feedback")
@@ -92,3 +103,8 @@ async def load_games(payload: LoadGamesPayload):
     except Exception as e:
         logger.exception("Ошибка при загрузке игр")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ===== RUN =====
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
