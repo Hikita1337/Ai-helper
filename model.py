@@ -209,7 +209,7 @@ class AIAssistant:
 
     # -------------------- Предикт и логирование --------------------
     def predict_and_log(self, payload):
-        t0 = time.time()
+    t0 = time.time()
     game_id = payload.get("game_id")
     bets = payload.get("bets") or []
     fast_game = payload.get("meta", {}).get("fast_game", False)
