@@ -1,5 +1,5 @@
+numpy==1.26.2 --only-binary :all:
+pandas==2.2.2 --only-binary :all:
 fastapi==0.95.2
 uvicorn[standard]==0.22.0
-numpy==1.26.2
-pandas==2.2.2
 requests==2.32.0
