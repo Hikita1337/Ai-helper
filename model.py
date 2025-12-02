@@ -6,27 +6,23 @@ from lightgbm import LGBMRegressor
 
 logger = logging.getLogger("ai_assistant.model")
 
-
 class AIAssistant:
     def __init__(self):
-        # История игр
         self.history_df = pd.DataFrame()
         self.crash_values = []
         self.games_index = set()
         self.user_counts = Counter()
         self.color_counts = Counter()
         self.bot_patterns = {}  # uid -> история ставок
-        self.pred_log = deque(maxlen=1000)  # лог предиктов
+        self.pred_log = deque(maxlen=1000)
+        self.color_sequence = deque(maxlen=50)  # последние N цветов
 
-        # Последние цвета
-        self.last_colors = deque(maxlen=50)
-
-        # Модель для Safe/Med/Risk
+        # LightGBM модели для Safe/Med/Risk
         self.model_safe = LGBMRegressor()
         self.model_med = LGBMRegressor()
         self.model_risk = LGBMRegressor()
 
-        # Контроль частоты онлайн-обучения
+        # очередь для онлайн-обучения
         self.pending_feedback = []
 
     # -------------------- Загрузка истории --------------------
@@ -53,12 +49,11 @@ class AIAssistant:
             self.crash_values.append(crash)
             if color_bucket:
                 self.color_counts[color_bucket] += 1
-                self.last_colors.append(color_bucket)
+                self.color_sequence.append(color_bucket)
             for b in bets:
                 uid = b.get("user_id")
                 if uid is not None:
                     self.user_counts[uid] += 1
-                    # Сохраняем паттерн бота
                     if uid not in self.bot_patterns:
                         self.bot_patterns[uid] = []
                     self.bot_patterns[uid].append({
@@ -89,6 +84,24 @@ class AIAssistant:
         frac_amount = (bot_amount / total_amount) if total_amount > 0 else 0.0
         return frac_amount, bot_ids
 
+    # -------------------- Создание признаков цветов --------------------
+    def _color_features(self):
+        # Частотные признаки
+        counts = Counter(self.color_sequence)
+        total = max(1, len(self.color_sequence))
+        freq_features = [counts.get(c, 0)/total for c in ["red","blue","pink","green","yellow","gradient"]]
+
+        # Паттерны переходов (двойные)
+        transitions = Counter()
+        seq = list(self.color_sequence)
+        for i in range(len(seq)-1):
+            key = f"{seq[i]}_{seq[i+1]}"
+            transitions[key] += 1
+        total_trans = max(1, sum(transitions.values()))
+        transition_features = [transitions.get(f"{a}_{b}",0)/total_trans for a in ["red","blue","pink","green","yellow","gradient"] for b in ["red","blue","pink","green","yellow","gradient"]]
+
+        return freq_features + transition_features
+
     # -------------------- Основной предикт --------------------
     def predict_and_log(self, payload):
         import time
@@ -97,16 +110,13 @@ class AIAssistant:
         bets = payload.get("bets") or []
         bot_frac_money, bot_ids = self.detect_bots_in_snapshot(bets)
 
-        # Подготовка признаков
         total_bets = sum(float(b.get("amount") or 0) for b in bets)
         num_bets = len(bets)
         avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
 
-        # Частоты последних цветов
-        color_features = self._color_features()
-        features = np.array([[bot_frac_money, num_bets, total_bets, avg_auto] + color_features])
+        color_feats = self._color_features()
+        features = np.array([[bot_frac_money, num_bets, total_bets, avg_auto] + color_feats])
 
-        # Если модель обучена, предсказываем Safe/Med/Risk
         try:
             safe = float(self.model_safe.predict(features))
             med = float(self.model_med.predict(features))
@@ -133,20 +143,10 @@ class AIAssistant:
         logger.info(f"Predicted for game {game_id}: safe={safe}, med={med}, risk={risk}, recommended_pct={recommended_pct:.2f}")
         logger.info(f"=== END PREDICT in {time.time()-start:.3f}s ===")
 
-    # -------------------- Фичи цветов --------------------
-    def _color_features(self):
-        counts = Counter(self.last_colors)
-        colors = ["red", "blue", "pink", "green", "yellow", "gradient"]
-        total = len(self.last_colors) or 1
-        return [counts[c]/total for c in colors]
-
     # -------------------- Обратная связь и онлайн-обучение --------------------
-    def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False, color_bucket=None):
+    def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False):
         self.games_index.add(game_id)
         self.crash_values.append(float(crash))
-        if color_bucket:
-            self.last_colors.append(color_bucket)
-            self.color_counts[color_bucket] += 1
 
         row = {
             "game_id": game_id,
@@ -154,8 +154,7 @@ class AIAssistant:
             "bets": bets or [],
             "deposit_sum": deposit_sum,
             "num_players": num_players,
-            "fast_game": fast_game,
-            "color_bucket": color_bucket
+            "fast_game": fast_game
         }
 
         for b in row["bets"]:
@@ -171,9 +170,10 @@ class AIAssistant:
                 })
 
         self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
-        self.pending_feedback.append(row)
+        if row.get("color_bucket"):
+            self.color_sequence.append(row["color_bucket"])
 
-        # Онлайн-обучение каждые 50 игр
+        self.pending_feedback.append(row)
         if len(self.pending_feedback) >= 50:
             self._online_train()
             self.pending_feedback.clear()
@@ -199,9 +199,8 @@ class AIAssistant:
             total_bets = sum(float(b.get("amount") or 0) for b in bets)
             num_bets = len(bets)
             avg_auto = np.mean([float(b.get("auto") or 0) for b in bets if b.get("auto") is not None] or [1.0])
-            color_features = self._color_features()
-            features.append([bot_frac, num_bets, total_bets, avg_auto] + color_features)
-
+            color_feats = self._color_features()
+            features.append([bot_frac, num_bets, total_bets, avg_auto] + color_feats)
             safe_targets.append(np.percentile([row.crash], 50))
             med_targets.append(np.percentile([row.crash], 75))
             risk_targets.append(np.percentile([row.crash], 90))
@@ -211,24 +210,4 @@ class AIAssistant:
         self.model_med.fit(X, np.array(med_targets))
         self.model_risk.fit(X, np.array(risk_targets))
 
-        logger.info("Online training completed for last 50 games.")
-
-    # -------------------- Анализ цветов --------------------
-    def estimate_color_probs(self):
-        if not self.crash_values:
-            return {}
-        arr = np.array(self.crash_values)
-        buckets = {
-            "red": (arr < 1.2).sum(),
-            "blue": ((arr >= 1.2) & (arr < 2)).sum(),
-            "pink": ((arr >= 2) & (arr < 4)).sum(),
-            "green": ((arr >= 4) & (arr < 8)).sum(),
-            "yellow": ((arr >= 8) & (arr < 25)).sum(),
-            "gradient": (arr >= 25).sum()
-        }
-        total = float(len(arr))
-        return {k: round(v/total, 3) for k, v in buckets.items()}
-
-    # -------------------- Получение лога предиктов --------------------
-    def get_pred_log(self, limit=20):
-        return list(self.pred_log)[-limit:]
+        logger.info("Online training completed for last 
