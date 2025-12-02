@@ -6,6 +6,7 @@ import logging
 import threading
 import time
 import requests
+import numpy as np  # <-- добавлено
 from model import AIAssistant
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -15,7 +16,7 @@ logger = logging.getLogger("ai_assistant")
 DATA_FILE = os.getenv("GAMES_FILE", "")  # путь к JSON с историей
 PERSIST_ON_UPDATE = os.getenv("PERSIST_ON_UPDATE", "false").lower() == "true"
 PORT = int(os.getenv("PORT", 8000))
-SELF_URL = os.getenv("SELF_URL")  # сюда укажи URL своего Render-сервера, например: https://my-app.onrender.com
+SELF_URL = os.getenv("SELF_URL")  # URL Render-сервера
 
 app = FastAPI(title="Crash AI Assistant")
 assistant = AIAssistant()
@@ -39,7 +40,7 @@ def keep_alive():
         except Exception as e:
             logger.warning(f"Keep-alive error: {e}")
         # случайная пауза 4–6 минут
-        time.sleep(240 + 120 * np.random.rand())
+        time.sleep(240 + 120 * np.random.rand())  # np.random.rand() теперь работает
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
