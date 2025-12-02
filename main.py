@@ -77,7 +77,7 @@ async def load_games(payload: LoadGamesPayload):
         resp = requests.get(payload.url, timeout=10)
         resp.raise_for_status()
         data = resp.json()
-        assistant.load_history_from_data(data)
+        assistant.load_history_from_list(data)
         logger.info(f"Игры загружены! Всего в истории: {assistant.history_count()}")
         return {"status": "ok", "games_loaded": assistant.history_count()}
     except Exception as e:
