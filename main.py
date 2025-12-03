@@ -46,8 +46,8 @@ async def mega_connect():
                 break
 
         if not FOLDER_ID:
-            folder = await mega_logged_in.create_folder(MEGA_FOLDER)
-            FOLDER_ID = folder["id"]
+    folder = await mega_logged_in.create_folder(MEGA_FOLDER)
+    FOLDER_ID = folder.node_id if hasattr(folder, "node_id") else folder["id"]
 
         logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
 
@@ -61,7 +61,7 @@ async def mega_find_file(name: str):
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
-    await mega_logged_in.upload(local_path, FOLDER_ID)
+    await mega_logged_in.upload(local_path, dest=FOLDER_ID)
     logger.info(f"Uploaded {local_path} to Mega")
 
 async def mega_download_file(remote_name: str, local_path: str):
