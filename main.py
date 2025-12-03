@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
+import io
 import logging
 import asyncio
 import aiohttp
@@ -132,10 +133,7 @@ async def save_backup_loop():
         await asyncio.sleep(3600)
 
 # ====================== History Load с флагом ======================
-CRASH_HISTORY_FILES = ["crash_23k.json"]
-
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
-    await asyncio.sleep(0.1)
     for filename in files:
         flag_file = filename + "_processed_flag.json"
         flag_remote = await yandex_find(flag_file)
@@ -150,39 +148,37 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
             continue
 
         try:
-            # Загружаем и обрабатываем блоками
-            data_buffer = b""
-            json_buffer = []
-            async for block in yandex_download_stream(remote):
-                data_buffer += block
-                try:
-                    partial = json.loads(data_buffer)
-                    if isinstance(partial, list):
-                        json_buffer.extend(partial)
-                        data_buffer = b""
-                except json.JSONDecodeError:
-                    continue
+            # Загружаем весь файл локально (потоково)
+            local_path = filename
+            async with aiofiles.open(local_path, "wb") as f:
+                async for block in yandex_download_stream(remote):
+                    await f.write(block)
 
-                while len(json_buffer) >= block_records:
-                    batch = json_buffer[:block_records]
+            # Теперь читаем JSON как поток через ijson
+            import ijson
+            with open(local_path, "r", encoding="utf-8") as f:
+                parser = ijson.items(f, "item")
+                batch = []
+                for record in parser:
+                    batch.append(record)
+                    if len(batch) >= block_records:
+                        assistant.load_history_from_list(batch)
+                        logger.info(f"Loaded block of {len(batch)} records from {filename}")
+                        batch = []
+                if batch:
                     assistant.load_history_from_list(batch)
-                    logger.info(f"Loaded block of {len(batch)} records from {filename}")
-                    json_buffer = json_buffer[block_records:]
-
-            if json_buffer:
-                assistant.load_history_from_list(json_buffer)
-                logger.info(f"Loaded final block of {len(json_buffer)} records from {filename}")
+                    logger.info(f"Loaded final block of {len(batch)} records from {filename}")
 
             # Создаём флаг, что обработка завершена
             async with aiofiles.open(flag_file, "w") as f:
                 await f.write(json.dumps({"processed": True}))
             await yandex_upload(flag_file, "/" + flag_file)
             os.remove(flag_file)
+            os.remove(local_path)
             logger.info(f"Processing of {filename} finished. Flag uploaded.")
 
         except Exception as e:
             logger.error("Error processing history file %s: %s", filename, e)
-
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
