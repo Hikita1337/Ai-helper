@@ -3,12 +3,11 @@ from pydantic import BaseModel
 import os
 import logging
 import asyncio
-import requests
+import aiohttp
 import json
 from ably import AblyRest
 from model import AIAssistant
-from mega import Mega
-import time
+from mega.client import Mega  # async-mega-py
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
@@ -30,94 +29,91 @@ mega_client: Mega | None = None
 mega_logged_in = None
 FOLDER_ID: str | None = None
 
-def mega_connect():
+async def mega_connect():
     global mega_client, mega_logged_in, FOLDER_ID
     if mega_client is None:
         mega_client = Mega()
-        mega_logged_in = mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
-        folders = mega_logged_in.get_files()
+        mega_logged_in = await mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
+        folders = await mega_logged_in.get_files()
         for k, v in folders.items():
             if v.get('a') and v['a']['n'] == MEGA_FOLDER and v['t'] == 1:
                 FOLDER_ID = k
                 break
         if not FOLDER_ID:
-            folder = mega_logged_in.create_folder(MEGA_FOLDER)
+            folder = await mega_logged_in.create_folder(MEGA_FOLDER)
             FOLDER_ID = folder['f']
         logger.info("Mega: connected")
 
-def mega_find_file(name: str):
-    mega_connect()
-    files = mega_logged_in.get_files()
+async def mega_find_file(name: str):
+    await mega_connect()
+    files = await mega_logged_in.get_files()
     for k, v in files.items():
         if v.get('a') and v['a']['n'] == name:
             return k
     return None
 
-def mega_upload_file(local_path: str):
-    mega_connect()
-    mega_logged_in.upload(local_path, dest=FOLDER_ID)
+async def mega_upload_file(local_path: str):
+    await mega_connect()
+    await mega_logged_in.upload(local_path, dest=FOLDER_ID)
     logger.info(f"Uploaded {local_path} to Mega")
 
-def mega_download_file(remote_name: str, local_path: str):
-    mega_connect()
-    file_id = mega_find_file(remote_name)
+async def mega_download_file(remote_name: str, local_path: str):
+    await mega_connect()
+    file_id = await mega_find_file(remote_name)
     if file_id:
-        mega_logged_in.download(file_id, local_path)
+        await mega_logged_in.download(file_id, local_path)
         logger.info(f"Downloaded {remote_name} from Mega")
 
-def mega_delete_file(name: str):
-    file_id = mega_find_file(name)
+async def mega_delete_file(name: str):
+    file_id = await mega_find_file(name)
     if file_id:
-        mega_logged_in.delete(file_id)
+        await mega_logged_in.delete(file_id)
         logger.info(f"Deleted {name} from Mega")
 
-def mega_rename_file(old_name: str, new_name: str):
-    file_id = mega_find_file(old_name)
+async def mega_rename_file(old_name: str, new_name: str):
+    file_id = await mega_find_file(old_name)
     if file_id:
-        mega_logged_in.rename(file_id, new_name)
+        await mega_logged_in.rename(file_id, new_name)
         logger.info(f"Renamed {old_name} -> {new_name}")
 
 # ====================== BACKUP ======================
 BACKUP_NAME = "assistant_backup.json"
 OLD_BACKUP_NAME = "assistant_backup_old.json"
 
-def save_backup():
+async def save_backup():
     try:
-        mega_connect()
-        # Переименовываем предыдущий бэкап
-        old_file_id = mega_find_file(BACKUP_NAME)
-        if old_file_id:
-            mega_rename_file(BACKUP_NAME, OLD_BACKUP_NAME)
+        await mega_connect()
 
-        # Сохраняем новый бэкап локально
+        old_file_id = await mega_find_file(BACKUP_NAME)
+        if old_file_id:
+            await mega_rename_file(BACKUP_NAME, OLD_BACKUP_NAME)
+
         with open(BACKUP_NAME, "w") as f:
             json.dump(assistant.export_state(), f)
 
-        # Загружаем на Mega
-        mega_upload_file(BACKUP_NAME)
+        await mega_upload_file(BACKUP_NAME)
 
-        # Перемещаем старый бэкап в корзину
-        old_file_id = mega_find_file(OLD_BACKUP_NAME)
+        old_file_id = await mega_find_file(OLD_BACKUP_NAME)
         if old_file_id:
-            mega_logged_in.trash(old_file_id)
+            await mega_logged_in.trash(old_file_id)
             logger.info("Old backup moved to Trash")
 
         logger.info("Backup updated successfully")
     except Exception as e:
         logger.error(f"Backup failed: {e}")
 
-def save_backup_loop():
+async def save_backup_loop():
     while True:
-        save_backup()
-        time.sleep(3600)  # пауза в потоке
+        await save_backup()
+        await asyncio.sleep(3600)  # асинхронная пауза
 
-def restore_backup():
+async def restore_backup():
     try:
-        file_id = mega_find_file(BACKUP_NAME)
+        file_id = await mega_find_file(BACKUP_NAME)
         if not file_id:
             logger.warning("No backups found")
             return
-        mega_download_file(BACKUP_NAME, BACKUP_NAME)
+        await mega_download_file(BACKUP_NAME, BACKUP_NAME)
         with open(BACKUP_NAME) as f:
             assistant.load_state(json.load(f))
         logger.info("Assistant state restored")
@@ -125,14 +121,14 @@ def restore_backup():
         logger.error(f"Restore error: {e}")
 
 # ====================== History Load ======================
-def load_big_history(filename="crash_23k.json"):
+async def load_big_history(filename="crash_23k.json"):
     try:
-        file_id = mega_find_file(filename)
+        file_id = await mega_find_file(filename)
         if not file_id:
             return
 
         logger.info("Downloading history from Mega...")
-        mega_download_file(filename, filename)
+        await mega_download_file(filename, filename)
 
         with open(filename) as f:
             data = json.load(f)
@@ -152,7 +148,8 @@ async def keep_alive_loop():
         return
     while True:
         try:
-            requests.get(f"{SELF_URL}/healthz", timeout=5)
+            async with aiohttp.ClientSession() as session:
+                await session.get(f"{SELF_URL}/healthz", timeout=5)
         except:
             pass
         await asyncio.sleep(240)
@@ -171,10 +168,9 @@ class FeedbackPayload(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    restore_backup()
-    # Асинхронные циклы через потоки
-    asyncio.create_task(asyncio.to_thread(save_backup_loop))
-    asyncio.create_task(asyncio.to_thread(load_big_history))
+    await restore_backup()
+    asyncio.create_task(save_backup_loop())
+    asyncio.create_task(load_big_history())
     asyncio.create_task(keep_alive_loop())
 
 @app.post("/predict")
