@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import os
 import logging
 import asyncio
+import aiofiles
 import aiohttp
 import json
 from dotenv import load_dotenv
@@ -134,8 +135,6 @@ async def save_backup_loop():
         await asyncio.sleep(3600)
 
 # ====================== History Load ======================
-import aiofiles
-
 async def yandex_download_stream(remote_path: str, local_path: str):
     """Скачивает файл из Яндекс.Диска потоково, чтобы не падало на больших файлах"""
     meta = await run_yandex_task(yadisk_client.get_meta, remote_path)
