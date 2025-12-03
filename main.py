@@ -39,14 +39,15 @@ async def mega_connect():
         mega_logged_in = await mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
 
         nodes = await mega_logged_in.get_files()
+        # ищем папку для бэкапов
         for node_id, node in nodes.items():
-            if getattr(node, "name", None) == MEGA_FOLDER and getattr(node, "type", None) == 1:
+            if node.get("name") == MEGA_FOLDER and node.get("type") == 1:
                 FOLDER_ID = node_id
                 break
 
         if not FOLDER_ID:
             folder = await mega_logged_in.create_folder(MEGA_FOLDER)
-            FOLDER_ID = folder.node_id
+            FOLDER_ID = folder["id"]
 
         logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
 
@@ -54,13 +55,13 @@ async def mega_find_file(name: str):
     await mega_connect()
     nodes = await mega_logged_in.get_files()
     for node_id, node in nodes.items():
-        if getattr(node, "name", None) == name:
+        if node.get("name") == name:
             return node_id
     return None
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
-    await mega_logged_in.upload(local_path, dest=FOLDER_ID)
+    await mega_logged_in.upload(local_path, folder=FOLDER_ID)
     logger.info(f"Uploaded {local_path} to Mega")
 
 async def mega_download_file(remote_name: str, local_path: str):
