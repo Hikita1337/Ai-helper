@@ -5,10 +5,12 @@ import logging
 import asyncio
 import aiohttp
 import json
+from dotenv import load_dotenv
 from ably import AblyRest
 from model import AIAssistant
-from mega.client import Mega  # async-mega-py
+from mega.client import Mega 
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
 
