@@ -57,7 +57,7 @@ async def mega_find_file(name: str):
     nodes = await mega_logged_in.get_files()
     for node_id, node in nodes.items():
         if node.get("name") == name:
-            return node["id"]
+            return node["h"]
     return None
 
 async def mega_upload_file(local_path: str):
