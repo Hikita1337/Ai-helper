@@ -45,10 +45,6 @@ async def mega_connect():
                 FOLDER_ID = node_id
                 break
 
-        if not FOLDER_ID:
-            folder = await mega_logged_in.create_folder(MEGA_FOLDER)
-            FOLDER_ID = folder["h"]
-
         logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
 
 
