@@ -7,7 +7,7 @@ import requests
 import json
 from ably import AblyRest
 from model import AIAssistant
-from mega import Mega  # классическая библиотека mega.py
+from mega import Mega  
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
