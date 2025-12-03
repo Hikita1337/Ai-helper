@@ -66,7 +66,9 @@ async def yandex_find(filename: str):
 
 async def yandex_download_stream(remote_path: str, chunk_size: int = 1024*1024):
     """Возвращает асинхронный генератор блоков данных из файла на Яндекс.Диске"""
-    download_url = yadisk_client.download_url(remote_path)
+    # Получаем прямую ссылку на файл
+    download_url = await run_yandex_task(yadisk_client.get_download_link, remote_path)
+    
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
