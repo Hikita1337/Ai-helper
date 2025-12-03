@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
-import io
 import logging
 import asyncio
 import aiohttp
@@ -11,6 +10,7 @@ from dotenv import load_dotenv
 from ably import AblyRest
 from model import AIAssistant
 import yadisk  # pip install yadisk
+import ijson  # pip install ijson
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -67,10 +67,8 @@ async def yandex_find(filename: str):
         return None
 
 async def yandex_download_stream(remote_path: str, chunk_size: int = 1024*1024):
-    """Возвращает асинхронный генератор блоков данных из файла на Яндекс.Диске"""
-    # Получаем прямую ссылку на файл
+    """Асинхронный генератор блоков данных из файла на Яндекс.Диске"""
     download_url = await run_yandex_task(yadisk_client.get_download_link, remote_path)
-    
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
@@ -124,7 +122,7 @@ async def restore_backup():
             logger.warning("No backup found to restore")
     except Exception as e:
         logger.error("Restore backup failed: %s", e)
-        
+
 async def save_backup_loop():
     while True:
         try:
@@ -133,7 +131,16 @@ async def save_backup_loop():
             logger.error("save_backup_loop error: %s", e)
         await asyncio.sleep(3600)
 
-# ====================== History Load с флагом ======================
+# ====================== History Load ======================
+async def stream_json_from_yadisk(remote_path: str):
+    """Асинхронно итерируем по JSON-массиву с Яндекс.Диска"""
+    download_url = await run_yandex_task(yadisk_client.get_download_link, remote_path)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(download_url) as resp:
+            resp.raise_for_status()
+            async for item in ijson.items_async(resp.content, "item"):
+                yield item
+
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
     for filename in files:
         flag_file = filename + "_processed_flag.json"
@@ -149,37 +156,26 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
             continue
 
         try:
-            # Загружаем весь файл локально (потоково)
-            local_path = filename
-            async with aiofiles.open(local_path, "wb") as f:
-                async for block in yandex_download_stream(remote):
-                    await f.write(block)
-
-            # Теперь читаем JSON как поток через ijson
-            import ijson
-            with open(local_path, "r", encoding="utf-8") as f:
-                parser = ijson.items(f, "item")
-                batch = []
-                for record in parser:
-                    batch.append(record)
-                    if len(batch) >= block_records:
-                        assistant.load_history_from_list(batch)
-                        logger.info(f"Loaded block of {len(batch)} records from {filename}")
-                        batch = []
-                if batch:
+            batch = []
+            async for record in stream_json_from_yadisk(remote):
+                batch.append(record)
+                if len(batch) >= block_records:
                     assistant.load_history_from_list(batch)
-                    logger.info(f"Loaded final block of {len(batch)} records from {filename}")
+                    logger.info(f"Loaded block of {len(batch)} records from {filename}")
+                    batch.clear()
+            if batch:
+                assistant.load_history_from_list(batch)
+                logger.info(f"Loaded final block of {len(batch)} records from {filename}")
 
             # Создаём флаг, что обработка завершена
             async with aiofiles.open(flag_file, "w") as f:
                 await f.write(json.dumps({"processed": True}))
             await yandex_upload(flag_file, "/" + flag_file)
-            os.remove(flag_file)
-            os.remove(local_path)
             logger.info(f"Processing of {filename} finished. Flag uploaded.")
 
         except Exception as e:
             logger.error("Error processing history file %s: %s", filename, e)
+
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
