@@ -40,7 +40,7 @@ async def mega_connect():
 
         nodes = await mega_logged_in.get_files()
         for node_id, node in nodes.items():
-            if isinstance(node, MegaFile) and node.name == MEGA_FOLDER and node.type == 1:
+            if getattr(node, "name", None) == MEGA_FOLDER and getattr(node, "type", None) == 1:
                 FOLDER_ID = node_id
                 break
 
@@ -54,7 +54,7 @@ async def mega_find_file(name: str):
     await mega_connect()
     nodes = await mega_logged_in.get_files()
     for node_id, node in nodes.items():
-        if isinstance(node, MegaFile) and node.name == name:
+        if getattr(node, "name", None) == name:
             return node_id
     return None
 
