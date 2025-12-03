@@ -20,6 +20,7 @@ PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
 ABLY_API_KEY = os.getenv("ABLY_API_KEY")
 YANDEX_ACCESS_TOKEN = os.getenv("YANDEX_ACCESS_TOKEN")
+CRASH_HISTORY_FILES = ["crash_23k.json"]
 
 assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
