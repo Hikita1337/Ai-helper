@@ -120,7 +120,7 @@ async def save_backup():
 
 
 # ====================== History Load ======================
-async def load_history_files(files=CRASH_HISTORY_FILES):
+async def load_history_files(files=crash_23k.json):
     await mega_connect()
     for filename in files:
         logger.info(f"Processing history file: {filename}")
