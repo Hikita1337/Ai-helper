@@ -49,7 +49,7 @@ if not FOLDER_ID:
     folder = await mega_logged_in.create_folder(MEGA_FOLDER)
     FOLDER_ID = folder.node_id if hasattr(folder, "node_id") else folder["id"]
 
-        logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
+logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
 
 async def mega_find_file(name: str):
     await mega_connect()
