@@ -12,7 +12,7 @@ from model import AIAssistant
 import yadisk  # pip install yadisk
 import ijson  # pip install ijson
 import io
-import ijson.asyncio
+
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
