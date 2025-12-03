@@ -142,7 +142,7 @@ async def load_history_files(files=CRASH_HISTORY_FILES):
         with open(filename) as f:
             data = json.load(f)
 
-        block = 5000
+        block = 7000
         for i in range(0, len(data), block):
             assistant.load_history_from_list(data[i:i+block])
             logger.info(f"Loaded block {i}-{min(i+block, len(data))} from {filename}")
