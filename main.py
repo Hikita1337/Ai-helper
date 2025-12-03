@@ -43,20 +43,23 @@ async def mega_connect():
 async def mega_find_file(name: str):
     await mega_connect()
     nodes = await mega_logged_in.get_files()
-    found = None
     for node_id, node in nodes.items():
+        # если node словарь — пробуем по стандарту
         if isinstance(node, dict):
-            node_name = node.get("a", {}).get("n", None)
+            node_name = node.get("a", {}).get("n")
+            node_handle = node.get("h")
+        # если node — строка или другой тип — логируем для отладки
         else:
+            logger.debug(f"Unexpected node type: {type(node)}, node: {node}")
             node_name = None
-        # Логирование для диагностики
-        logger.debug(f"Node id={node_id} type={type(node)} name_attr={node_name!r}")
+            node_handle = None
+
         if node_name == name:
-            found = node.get("h") if isinstance(node, dict) else None
-            break
-    if not found:
-        logger.warning(f"File '{name}' not found. Existing entries: {[ (nid, (n.get('a', {}).get('n') if isinstance(n, dict) else None)) for nid,n in nodes.items() ]}")
-    return found
+            return node_handle
+    # логируем весь список для проверки
+    logger.warning("Could not find file %s; entries: %s", name,
+                   [ (nid, (n.get("a", {}).get("n") if isinstance(n, dict) else None)) for nid, n in nodes.items() ])
+    return None
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
