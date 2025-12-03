@@ -11,6 +11,7 @@ from ably import AblyRest
 from model import AIAssistant
 import yadisk  # pip install yadisk
 import ijson  # pip install ijson
+import io
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -133,22 +134,13 @@ async def save_backup_loop():
 
 # ====================== History Load ======================
 async def stream_json_from_yadisk(remote_path: str):
-    """Асинхронно итерируем по JSON-массиву с Яндекс.Диска"""
+    """Асинхронно итерируем по JSON-массиву с Яндекс.Диска, стримингом прямо из ответа."""
     download_url = await run_yandex_task(yadisk_client.get_download_link, remote_path)
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
-            buffer = b""
-            async for chunk in resp.content.iter_chunked(1024*64):
-                buffer += chunk
-                while True:
-                    try:
-                        for item in ijson.items(io.BytesIO(buffer), "", multiple_values=True):
-                            yield item
-                        buffer = b""
-                        break
-                    except ijson.common.IncompleteJSONError:
-                        break
+            async for item in ijson.items_async(resp.content, "item"):
+                yield item
 
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
     for filename in files:
@@ -172,6 +164,7 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
                     assistant.load_history_from_list(batch)
                     logger.info(f"Loaded block of {len(batch)} records from {filename}")
                     batch.clear()
+
             if batch:
                 assistant.load_history_from_list(batch)
                 logger.info(f"Loaded final block of {len(batch)} records from {filename}")
