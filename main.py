@@ -150,9 +150,11 @@ async def stream_json_from_yadisk(remote_path: str):
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
     for filename in files:
         flag_file = filename + "_processed_flag.json"
+
+        # Проверяем, не обработан ли уже файл
         flag_remote = await yandex_find(flag_file)
         if flag_remote:
-            logger.info(f"File {filename} was уже processed. Skipping.")
+            logger.info(f"File {filename} was already processed. Skipping.")
             continue
 
         logger.info(f"Processing history file: {filename}")
@@ -170,18 +172,19 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
                     logger.info(f"Loaded block of {len(batch)} records from {filename}")
                     batch.clear()
 
+            # Загружаем остаток
             if batch:
                 assistant.load_history_from_list(batch)
                 logger.info(f"Loaded final block of {len(batch)} records from {filename}")
 
-            # Создаём флаг, что обработка завершена
+            # Создаем флаг обработки
             async with aiofiles.open(flag_file, "w") as f:
                 await f.write(json.dumps({"processed": True}))
             await yandex_upload(flag_file, "/" + flag_file)
             logger.info(f"Processing of {filename} finished. Flag uploaded.")
 
         except Exception as e:
-            logger.error("Error processing history file %s: %s", filename, e)
+            logger.error(f"Error processing history file {filename}: {e}")
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
