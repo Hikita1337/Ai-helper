@@ -42,14 +42,15 @@ async def mega_connect():
         # ищем папку для бэкапов
         for node_id, node in nodes.items():
             if node.get("name") == MEGA_FOLDER and node.get("type") == 1:
-                FOLDER_ID = node["id"]
+                FOLDER_ID = node_id
                 break
 
-if not FOLDER_ID:
-    folder = await mega_logged_in.create_folder(MEGA_FOLDER)
-    FOLDER_ID = folder.node_id if hasattr(folder, "node_id") else folder["id"]
+        if not FOLDER_ID:
+            folder = await mega_logged_in.create_folder(MEGA_FOLDER)
+            FOLDER_ID = folder["id"]
 
-logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
+        logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
+
 
 async def mega_find_file(name: str):
     await mega_connect()
