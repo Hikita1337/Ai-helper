@@ -44,6 +44,25 @@ class AIAssistant:
         # Метрики истории тренировки
         self.last_metrics = {}
 
+def get_pred_log(self, limit: int = 20):
+        """
+        Возвращает последние `limit` предсказаний.
+        Если pred_log ещё не создан, возвращает пустой список.
+        """
+        try:
+            return self.pred_log[-limit:] if hasattr(self, 'pred_log') else []
+        except Exception:
+            return []
+            
+def get_status(self):
+    
+    return {
+        "total_games": len(self.games_index),
+        "pred_log_len": len(self.pred_log),
+        "total_users": len(self.user_counts),
+        "total_bot_patterns": len(self.bot_patterns)
+    }
+    
     # -------------------- Экспорт/импорт состояния --------------------
     def export_state(self):
         state = {
