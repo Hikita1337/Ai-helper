@@ -134,6 +134,22 @@ async def save_backup_loop():
         await asyncio.sleep(3600)
 
 # ====================== History Load ======================
+import aiofiles
+
+async def yandex_download_stream(remote_path: str, local_path: str):
+    """Скачивает файл из Яндекс.Диска потоково, чтобы не падало на больших файлах"""
+    meta = await run_yandex_task(yadisk_client.get_meta, remote_path)
+    download_url = meta.file  # прямая ссылка на файл
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(download_url) as resp:
+            resp.raise_for_status()
+            async with aiofiles.open(local_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 1024):  # по 1 МБ
+                    await f.write(chunk)
+    return local_path
+
+
 CRASH_HISTORY_FILES = ["crash_23k.json"]
 
 async def load_history_files(files=CRASH_HISTORY_FILES):
@@ -145,18 +161,20 @@ async def load_history_files(files=CRASH_HISTORY_FILES):
             logger.warning(f"File {filename} not found in Yandex Disk")
             continue
         try:
-            await yandex_download(remote, filename)
+            # Скачиваем потоково
+            await yandex_download_stream(remote, filename)
+
             with open(filename) as f:
                 data = json.load(f)
             block = 7000
             for i in range(0, len(data), block):
                 assistant.load_history_from_list(data[i:i+block])
                 logger.info(f"Loaded block {i}-{min(i+block, len(data))} from {filename}")
+
             os.remove(filename)
             logger.info(f"File {filename} removed from local storage")
         except Exception as e:
             logger.error("Error processing history file %s: %s", filename, e)
-
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
