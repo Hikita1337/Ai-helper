@@ -135,13 +135,16 @@ async def save_backup_loop():
 
 # ====================== History Load ======================
 async def stream_json_from_yadisk(remote_path: str):
-    """Асинхронно итерируем по JSON-массиву с Яндекс.Диска."""
+    """
+    Асинхронно итерируем по JSON-массиву с Яндекс.Диска.
+    Работает с ijson.items_async напрямую, без несуществующих модулей.
+    """
     download_url = await run_yandex_task(yadisk_client.get_download_link, remote_path)
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
-            # ijson.asyncio.items_async умеет работать с resp.content напрямую
-            async for item in ijson.asyncio.items_async(resp.content, "item"):
+            # items_async умеет работать с resp.content напрямую
+            async for item in ijson.items_async(resp.content, "item"):
                 yield item
 
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
