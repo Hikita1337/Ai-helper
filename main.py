@@ -8,7 +8,7 @@ import json
 from dotenv import load_dotenv
 from ably import AblyRest
 from model import AIAssistant
-from mega.client import Mega
+import subprocess
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -21,56 +21,43 @@ ABLY_API_KEY = os.getenv("ABLY_API_KEY")
 MEGA_EMAIL = os.getenv("MEGA_EMAIL")
 MEGA_PASSWORD = os.getenv("MEGA_PASSWORD")
 
-
 assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("crash_ai_hud")
 
-# ====================== Mega ======================
-mega_client: Mega | None = None
-mega_logged_in = None
+# ====================== Mega-CMD ======================
+
+async def run_mega_cmd(*args):
+    """Запуск команды Mega-CMD в отдельном потоке"""
+    cmd = ["mega-login", MEGA_EMAIL, MEGA_PASSWORD] if args[0] == "login" else ["mega"] + list(args)
+    try:
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, check=True)
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Mega-CMD failed: {e.stderr}")
+        raise
 
 async def mega_connect():
-    global mega_client, mega_logged_in
-    if mega_client is None:
-        mega_client = Mega()
-        logger.info("Logging in to Mega...")
-        mega_logged_in = await mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
-        await mega_logged_in.get_files()  # инициализация файловой сессии
-        logger.info("Mega connected")
-        
-        
-async def mega_find_file(name: str):
-    await mega_connect()
-    nodes = await mega_logged_in.get_files()
-    for node_id, node in nodes.items():
-        # если node словарь — пробуем по стандарту
-        if isinstance(node, dict):
-            node_name = node.get("a", {}).get("n")
-            node_handle = node.get("h")
-        # если node — строка или другой тип — логируем для отладки
-        else:
-            logger.debug(f"Unexpected node type: {type(node)}, node: {node}")
-            node_name = None
-            node_handle = None
+    # Логин только раз
+    await run_mega_cmd("login")
 
-        if node_name == name:
-            return node_handle
-    # логируем весь список для проверки
-    logger.warning("Could not find file %s; entries: %s", name,
-                   [ (nid, (n.get("a", {}).get("n") if isinstance(n, dict) else None)) for nid, n in nodes.items() ])
+async def mega_find_file(name: str):
+    output = await run_mega_cmd("ls")
+    for line in output.splitlines():
+        parts = line.split()
+        if parts and parts[-1] == name:
+            return name  # возвращаем просто имя, MEGAcmd использует его напрямую
+    logger.warning(f"Could not find file {name} in Mega root")
     return None
 
 async def mega_upload_file(local_path: str):
-    await mega_connect()
-    await mega_logged_in.upload(local_path)  # загружает в корень
+    await run_mega_cmd("put", local_path, "/")
     logger.info(f"Uploaded {local_path} to Mega")
-    
+
 async def mega_download_file(remote_name: str, local_path: str):
-    await mega_connect()
-    file_handle = await mega_find_file(remote_name)
-    if file_handle:
-        await mega_logged_in.download(file_handle, local_path)
+    file_id = await mega_find_file(remote_name)
+    if file_id:
+        await run_mega_cmd("get", f"/{file_id}", local_path)
         logger.info(f"Downloaded {remote_name} from Mega")
         return True
     return False
@@ -78,13 +65,13 @@ async def mega_download_file(remote_name: str, local_path: str):
 async def mega_delete_file(name: str):
     file_id = await mega_find_file(name)
     if file_id:
-        await mega_logged_in.delete(file_id)
+        await run_mega_cmd("rm", f"/{file_id}")
         logger.info(f"Deleted {name} from Mega")
 
 async def mega_rename_file(old_name: str, new_name: str):
     file_id = await mega_find_file(old_name)
     if file_id:
-        await mega_logged_in.rename(file_id, new_name)
+        await run_mega_cmd("mv", f"/{file_id}", f"/{new_name}")
         logger.info(f"Renamed {old_name} -> {new_name}")
 
 # ====================== Backup ======================
@@ -105,7 +92,7 @@ async def save_backup():
 
         old_file_id = await mega_find_file(OLD_BACKUP_NAME)
         if old_file_id:
-            await mega_logged_in.delete(old_file_id)
+            await mega_delete_file(OLD_BACKUP_NAME)
             logger.info("Old backup removed after upload")
 
         logger.info("Backup updated successfully")
@@ -128,7 +115,7 @@ async def restore_backup():
 async def save_backup_loop():
     while True:
         await save_backup()
-        await asyncio.sleep(3600)  # строго раз в час
+        await asyncio.sleep(3600)  # раз в час
 
 # ====================== History Load ======================
 CRASH_HISTORY_FILES = ["crash_23k.json"]
