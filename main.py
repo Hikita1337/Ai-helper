@@ -62,7 +62,7 @@ async def mega_find_file(name: str):
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
-    await mega_logged_in.upload(local_path, dest=FOLDER_ID)
+    await mega_logged_in.upload(local_path, node=FOLDER_ID)
     logger.info(f"Uploaded {local_path} to Mega")
 
 async def mega_download_file(remote_name: str, local_path: str):
