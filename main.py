@@ -7,7 +7,8 @@ import requests
 import json
 from ably import AblyRest
 from model import AIAssistant
-from mega import Mega  
+from mega import Mega
+import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
@@ -36,7 +37,7 @@ def mega_connect():
         mega_logged_in = mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
         folders = mega_logged_in.get_files()
         for k, v in folders.items():
-            if v.get('a') and v['a']['n'] == MEGA_FOLDER and v['t'] == 1:  # папка
+            if v.get('a') and v['a']['n'] == MEGA_FOLDER and v['t'] == 1:
                 FOLDER_ID = k
                 break
         if not FOLDER_ID:
@@ -83,7 +84,6 @@ OLD_BACKUP_NAME = "assistant_backup_old.json"
 def save_backup():
     try:
         mega_connect()
-
         # Переименовываем предыдущий бэкап
         old_file_id = mega_find_file(BACKUP_NAME)
         if old_file_id:
@@ -109,7 +109,7 @@ def save_backup():
 def save_backup_loop():
     while True:
         save_backup()
-        asyncio.sleep(3600)
+        time.sleep(3600)  # пауза в потоке
 
 def restore_backup():
     try:
@@ -172,7 +172,7 @@ class FeedbackPayload(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     restore_backup()
-    # Асинхронные циклы
+    # Асинхронные циклы через потоки
     asyncio.create_task(asyncio.to_thread(save_backup_loop))
     asyncio.create_task(asyncio.to_thread(load_big_history))
     asyncio.create_task(keep_alive_loop())
