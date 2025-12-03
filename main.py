@@ -42,7 +42,7 @@ async def mega_connect():
         # ищем папку для бэкапов
         for node_id, node in nodes.items():
             if node.get("name") == MEGA_FOLDER and node.get("type") == 1:
-                FOLDER_ID = node_id
+                FOLDER_ID = node["id"]
                 break
 
         if not FOLDER_ID:
@@ -56,12 +56,12 @@ async def mega_find_file(name: str):
     nodes = await mega_logged_in.get_files()
     for node_id, node in nodes.items():
         if node.get("name") == name:
-            return node_id
+            return node["id"]
     return None
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
-    await mega_logged_in.upload(local_path, folder=FOLDER_ID)
+    await mega_logged_in.upload(local_path, FOLDER_ID)
     logger.info(f"Uploaded {local_path} to Mega")
 
 async def mega_download_file(remote_name: str, local_path: str):
@@ -84,7 +84,6 @@ async def mega_rename_file(old_name: str, new_name: str):
     if file_id:
         await mega_logged_in.rename(file_id, new_name)
         logger.info(f"Renamed {old_name} -> {new_name}")
-
 
 # ====================== Backup ======================
 BACKUP_NAME = "assistant_backup.json"
@@ -129,7 +128,6 @@ async def save_backup_loop():
         await save_backup()
         await asyncio.sleep(3600)  # строго раз в час
 
-
 # ====================== History Load ======================
 CRASH_HISTORY_FILES = ["crash_23k.json"]
 
@@ -152,6 +150,7 @@ async def load_history_files(files=CRASH_HISTORY_FILES):
 
         os.remove(filename)
         logger.info(f"File {filename} removed from local storage")
+
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
