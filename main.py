@@ -42,10 +42,13 @@ async def mega_connect():
         
 async def mega_find_file(name: str):
     await mega_connect()
-    nodes = await mega_logged_in.get_files()
+    nodes = await mega_logged_in.get_files()  # обновляем список файлов
     for node_id, node in nodes.items():
-        if node.get("name") == name:
+        node_name = node.get("name", "").strip()  # убираем пробелы/символы
+        if node_name == name:
             return node.get("h")  # handle файла
+    # для отладки
+    logger.warning(f"File '{name}' not found. Existing files: {[n.get('name') for n in nodes.values()]}")
     return None
 
 async def mega_upload_file(local_path: str):
