@@ -8,7 +8,7 @@ import json
 from dotenv import load_dotenv
 from ably import AblyRest
 from model import AIAssistant
-import subprocess
+import shlex
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -20,80 +20,198 @@ ABLY_API_KEY = os.getenv("ABLY_API_KEY")
 
 MEGA_EMAIL = os.getenv("MEGA_EMAIL")
 MEGA_PASSWORD = os.getenv("MEGA_PASSWORD")
+MEGA_CMD_PATH = os.getenv("MEGA_CMD_PATH", "mega")  # путь к бинарю mega (можно оставить "mega" если в PATH)
 
 assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("crash_ai_hud")
 
-# ====================== Mega-CMD ======================
+# ====================== Mega-CMD via subprocess ======================
+# Очередь команд для последовательного выполнения (чтобы Mega-CMD не конфликтовал)
+mega_cmd_queue: asyncio.Queue = asyncio.Queue()
+mega_worker_task: asyncio.Task | None = None
 
-async def run_mega_cmd(*args):
-    """Запуск команды Mega-CMD в отдельном потоке"""
-    cmd = ["mega-login", MEGA_EMAIL, MEGA_PASSWORD] if args[0] == "login" else ["mega"] + list(args)
+async def run_mega_cmd_raw(args: list[str], timeout: int = 120) -> tuple[int, str, str]:
+    """Запустить mega команду как подпроцесс; возвращает (returncode, stdout, stderr)."""
+    cmd = [MEGA_CMD_PATH] + args
+    logger.debug("Run mega cmd: %s", " ".join(shlex.quote(x) for x in cmd))
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
     try:
-        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, check=True)
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Mega-CMD failed: {e.stderr}")
-        raise
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"mega command timeout: {' '.join(cmd)}")
+    stdout = out.decode(errors="ignore") if out else ""
+    stderr = err.decode(errors="ignore") if err else ""
+    logger.debug("Mega stdout: %s", stdout.strip())
+    logger.debug("Mega stderr: %s", stderr.strip())
+    return proc.returncode, stdout, stderr
 
-async def mega_connect():
-    # Логин только раз
-    await run_mega_cmd("login")
+async def mega_worker():
+    """Worker, который последовательно выполняет команды из очереди."""
+    logger.info("Mega worker started")
+    while True:
+        item = await mega_cmd_queue.get()
+        cmd_args, fut, timeout = item
+        try:
+            rc, out, err = await run_mega_cmd_raw(cmd_args, timeout=timeout)
+            if rc != 0:
+                fut.set_exception(RuntimeError(f"mega cmd failed rc={rc}, err={err.strip()}"))
+            else:
+                fut.set_result(out)
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+        finally:
+            mega_cmd_queue.task_done()
 
-async def mega_find_file(name: str):
-    output = await run_mega_cmd("ls")
-    for line in output.splitlines():
+async def enqueue_mega(cmd_args: list[str], timeout: int = 120) -> str:
+    """Поместить команду в очередь и дождаться результата (stdout) или исключения."""
+    fut = asyncio.get_event_loop().create_future()
+    await mega_cmd_queue.put((cmd_args, fut, timeout))
+    return await fut
+
+# high-level обертки --------------------------------------------------------
+async def mega_login():
+    """Войти в Mega через CLI (использует MEGA_EMAIL/MEGA_PASSWORD)."""
+    if not MEGA_EMAIL or not MEGA_PASSWORD:
+        logger.warning("MEGA_EMAIL/MEGA_PASSWORD not set — пропускаем логин")
+        return
+    try:
+        out = await enqueue_mega(["login", MEGA_EMAIL, MEGA_PASSWORD], timeout=60)
+        logger.info("Mega login result: %s", out.strip())
+    except Exception as e:
+        logger.error("Mega login failed: %s", e)
+        # не падаем — приложение всё равно должно стартовать
+
+async def mega_ls_all() -> str:
+    """Получить рекурсивный список файлов (text)."""
+    # -R рекурсивно; может быть медленно для большого аккаунта
+    return await enqueue_mega(["ls", "-R", "/"], timeout=120)
+
+def parse_ls_for_paths(ls_text: str) -> list[str]:
+    """
+    Простейший парсер вывода `mega ls -R /`.
+    Он ищет строки, похожие на пути и имена.
+    Формат `mega-ls` может отличаться между версиями; этот парсер пытается извлечь имена файлов.
+    Возвращает список строк (пути вида /path/to/file).
+    """
+    lines = ls_text.splitlines()
+    paths = []
+    current_dir = ""
+    for line in lines:
+        line = line.rstrip()
+        if not line:
+            continue
+        # директория: заканчивается на ':' e.g. /some/folder:
+        if line.endswith(":"):
+            current_dir = line[:-1]
+            if not current_dir.startswith("/"):
+                current_dir = "/" + current_dir.lstrip("/")
+            continue
+        # строка файла/папки — берем имя первого слова (обычно)
+        # Простейшая логика: имя — последнее слово
         parts = line.split()
-        if parts and parts[-1] == name:
-            return name  # возвращаем просто имя, MEGAcmd использует его напрямую
-    logger.warning(f"Could not find file {name} in Mega root")
+        if not parts:
+            continue
+        name = parts[-1]
+        # игнорируем служебные строки
+        if name in (".", ".."):
+            continue
+        full = current_dir.rstrip("/") + "/" + name if current_dir else "/" + name
+        paths.append(full)
+    return paths
+
+async def mega_ls_find(name: str) -> str | None:
+    """
+    Найти путь к файлу с точным именем `name`. Возвращает первый найденный remote-path (например /crash_23k.json).
+    Если не найден — None.
+    """
+    try:
+        out = await mega_ls_all()
+    except Exception as e:
+        logger.error("mega_ls_all failed: %s", e)
+        return None
+    paths = parse_ls_for_paths(out)
+    # Ищем точное совпадение по имени (последний сегмент)
+    for p in paths:
+        if p.rstrip("/").split("/")[-1] == name:
+            logger.debug("Found file %s -> %s", name, p)
+            return p
+    logger.debug("File %s not found in parsed ls output", name)
     return None
 
-async def mega_upload_file(local_path: str):
-    await run_mega_cmd("put", local_path, "/")
-    logger.info(f"Uploaded {local_path} to Mega")
+async def mega_put(local_path: str, remote_path: str | None = None):
+    """
+    Загрузить local_path на Mega.
+    Если remote_path is None — загрузит в корень (оставит имя файла).
+    Если remote_path задан — используется как путь /path/on/mega (если папки нет — mega создаст).
+    """
+    if remote_path:
+        args = ["put", local_path, remote_path]
+    else:
+        args = ["put", local_path]
+    return await enqueue_mega(args, timeout=600)
 
-async def mega_download_file(remote_name: str, local_path: str):
-    file_id = await mega_find_file(remote_name)
-    if file_id:
-        await run_mega_cmd("get", f"/{file_id}", local_path)
-        logger.info(f"Downloaded {remote_name} from Mega")
-        return True
-    return False
+async def mega_get(remote_path: str, local_path: str):
+    """Скачать файл remote_path (например /crash_23k.json) в local_path."""
+    return await enqueue_mega(["get", remote_path, local_path], timeout=600)
 
-async def mega_delete_file(name: str):
-    file_id = await mega_find_file(name)
-    if file_id:
-        await run_mega_cmd("rm", f"/{file_id}")
-        logger.info(f"Deleted {name} from Mega")
+async def mega_rm(remote_path: str):
+    """Удалить файл/путь на Mega."""
+    return await enqueue_mega(["rm", remote_path], timeout=120)
 
-async def mega_rename_file(old_name: str, new_name: str):
-    file_id = await mega_find_file(old_name)
-    if file_id:
-        await run_mega_cmd("mv", f"/{file_id}", f"/{new_name}")
-        logger.info(f"Renamed {old_name} -> {new_name}")
+async def mega_mkdir(remote_path: str):
+    return await enqueue_mega(["mkdir", remote_path], timeout=60)
 
-# ====================== Backup ======================
+async def mega_mv(src: str, dst: str):
+    return await enqueue_mega(["mv", src, dst], timeout=120)
+
+async def mega_emptytrash():
+    return await enqueue_mega(["trash", "empty"], timeout=60)
+
+# ====================== Backup logic (uses above wrappers) ======================
 BACKUP_NAME = "assistant_backup.json"
 OLD_BACKUP_NAME = "assistant_backup_old.json"
 
 async def save_backup():
     try:
-        await mega_connect()
-        old_file_id = await mega_find_file(BACKUP_NAME)
-        if old_file_id:
-            await mega_rename_file(BACKUP_NAME, OLD_BACKUP_NAME)
+        logger.info("Saving backup...")
+        # найти текущий бэкап
+        existing = await mega_ls_find(BACKUP_NAME)
+        if existing:
+            # переместить текущий бэкап (пометить старым: mv /assistant_backup.json /assistant_backup_old.json)
+            # если уже есть OLD — удалить OLD (переместим, затем удалим OLD из корзины)
+            old_existing = await mega_ls_find(OLD_BACKUP_NAME)
+            if old_existing:
+                # удаляем старый (поместится в корзину)
+                try:
+                    await mega_rm(old_existing)
+                    logger.info("Removed previous old backup %s", old_existing)
+                except Exception as e:
+                    logger.warning("Failed to remove previous old backup: %s", e)
+            try:
+                await mega_mv(existing, "/" + OLD_BACKUP_NAME)
+                logger.info("Renamed current backup %s -> %s", existing, OLD_BACKUP_NAME)
+            except Exception as e:
+                logger.warning("Failed to mv existing backup: %s", e)
 
+        # сохраняем текущий state в локальный файл
         with open(BACKUP_NAME, "w") as f:
             json.dump(assistant.export_state(), f)
 
-        await mega_upload_file(BACKUP_NAME)
+        # загружаем новый бэкап
+        # загружаем в корень: mega put assistant_backup.json /
+        await mega_put(BACKUP_NAME, "/" + BACKUP_NAME)
+        logger.info("Uploaded %s to Mega", BACKUP_NAME)
 
-        old_file_id = await mega_find_file(OLD_BACKUP_NAME)
-        if old_file_id:
-            await mega_delete_file(OLD_BACKUP_NAME)
-            logger.info("Old backup removed after upload")
+        # очистка корзины (необязательная): оставим в корзине OLD; если хочешь полностью стирать — раскомментируй:
+        # await mega_emptytrash()
 
         logger.info("Backup updated successfully")
     except Exception as e:
@@ -101,8 +219,10 @@ async def save_backup():
 
 async def restore_backup():
     try:
-        downloaded = await mega_download_file(BACKUP_NAME, BACKUP_NAME)
-        if downloaded:
+        logger.info("Restoring backup if exists...")
+        remote = await mega_ls_find(BACKUP_NAME)
+        if remote:
+            await mega_get(remote, BACKUP_NAME)
             with open(BACKUP_NAME) as f:
                 state = json.load(f)
             assistant.load_state(state)
@@ -114,31 +234,36 @@ async def restore_backup():
 
 async def save_backup_loop():
     while True:
-        await save_backup()
-        await asyncio.sleep(3600)  # раз в час
+        try:
+            await save_backup()
+        except Exception as e:
+            logger.error("save_backup_loop error: %s", e)
+        await asyncio.sleep(3600)  # строго раз в час
 
 # ====================== History Load ======================
 CRASH_HISTORY_FILES = ["crash_23k.json"]
 
 async def load_history_files(files=CRASH_HISTORY_FILES):
-    await mega_connect()
+    await asyncio.sleep(0.1)  # небольшой сдвиг, чтобы worker стартовал
     for filename in files:
         logger.info(f"Processing history file: {filename}")
-        file_downloaded = await mega_download_file(filename, filename)
-        if not file_downloaded:
+        remote = await mega_ls_find(filename)
+        if not remote:
             logger.warning(f"File {filename} not found in Mega")
             continue
-
-        with open(filename) as f:
-            data = json.load(f)
-
-        block = 7000
-        for i in range(0, len(data), block):
-            assistant.load_history_from_list(data[i:i+block])
-            logger.info(f"Loaded block {i}-{min(i+block, len(data))} from {filename}")
-
-        os.remove(filename)
-        logger.info(f"File {filename} removed from local storage")
+        try:
+            # скачиваем и обрабатываем локально
+            await mega_get(remote, filename)
+            with open(filename) as f:
+                data = json.load(f)
+            block = 7000
+            for i in range(0, len(data), block):
+                assistant.load_history_from_list(data[i:i+block])
+                logger.info(f"Loaded block {i}-{min(i+block, len(data))} from {filename}")
+            os.remove(filename)
+            logger.info(f"File {filename} removed from local storage")
+        except Exception as e:
+            logger.error("Error processing history file %s: %s", filename, e)
 
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
@@ -166,8 +291,17 @@ class FeedbackPayload(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
+    global mega_worker_task
+    # старт worker'а очереди
+    if mega_worker_task is None:
+        mega_worker_task = asyncio.create_task(mega_worker())
+
+    # логинимся (через очередь), затем пытаемся восстановить стейт и загрузить истории
+    await mega_login()
     await restore_backup()
     await load_history_files()
+
+    # запуски периодических задач
     asyncio.create_task(save_backup_loop())
     asyncio.create_task(keep_alive_loop())
 
