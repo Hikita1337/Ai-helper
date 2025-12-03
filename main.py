@@ -27,7 +27,6 @@ ably_client = AblyRest(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("crash_ai_hud")
 
 # ====================== Mega ======================
-
 mega_client: Mega | None = None
 mega_logged_in = None
 FOLDER_ID: str | None = None
@@ -39,10 +38,10 @@ async def mega_connect():
         logger.info("Logging in to Mega...")
         mega_logged_in = await mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
 
-        files = await mega_logged_in.get_files()
-        for file_id, file_obj in files.items():
-            if isinstance(file_obj, MegaFile) and file_obj.name == MEGA_FOLDER and file_obj.type == 1:  # папка
-                FOLDER_ID = file_id
+        nodes = await mega_logged_in.get_files()
+        for node_id, node in nodes.items():
+            if isinstance(node, MegaFile) and node.name == MEGA_FOLDER and node.type == 1:
+                FOLDER_ID = node_id
                 break
 
         if not FOLDER_ID:
@@ -51,21 +50,18 @@ async def mega_connect():
 
         logger.info(f"Mega connected, folder ID: {FOLDER_ID}")
 
-
 async def mega_find_file(name: str):
     await mega_connect()
-    files = await mega_logged_in.get_files()
-    for file_id, file_obj in files.items():
-        if isinstance(file_obj, MegaFile) and file_obj.name == name:
-            return file_id
+    nodes = await mega_logged_in.get_files()
+    for node_id, node in nodes.items():
+        if isinstance(node, MegaFile) and node.name == name:
+            return node_id
     return None
-
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
     await mega_logged_in.upload(local_path, dest=FOLDER_ID)
     logger.info(f"Uploaded {local_path} to Mega")
-
 
 async def mega_download_file(remote_name: str, local_path: str):
     await mega_connect()
@@ -76,13 +72,11 @@ async def mega_download_file(remote_name: str, local_path: str):
         return True
     return False
 
-
 async def mega_delete_file(name: str):
     file_id = await mega_find_file(name)
     if file_id:
         await mega_logged_in.delete(file_id)
         logger.info(f"Deleted {name} from Mega")
-
 
 async def mega_rename_file(old_name: str, new_name: str):
     file_id = await mega_find_file(old_name)
@@ -90,25 +84,22 @@ async def mega_rename_file(old_name: str, new_name: str):
         await mega_logged_in.rename(file_id, new_name)
         logger.info(f"Renamed {old_name} -> {new_name}")
 
-
 # ====================== Backup ======================
+BACKUP_NAME = "assistant_backup.json"
+OLD_BACKUP_NAME = "assistant_backup_old.json"
+
 async def save_backup():
     try:
         await mega_connect()
-
-        # Переименовать текущий бэкап в старый
         old_file_id = await mega_find_file(BACKUP_NAME)
         if old_file_id:
             await mega_rename_file(BACKUP_NAME, OLD_BACKUP_NAME)
 
-        # Сохраняем текущий state ассистента
         with open(BACKUP_NAME, "w") as f:
             json.dump(assistant.export_state(), f)
 
-        # Загружаем новый бэкап
         await mega_upload_file(BACKUP_NAME)
 
-        # Удаляем старый бэкап
         old_file_id = await mega_find_file(OLD_BACKUP_NAME)
         if old_file_id:
             await mega_logged_in.delete(old_file_id)
@@ -117,6 +108,24 @@ async def save_backup():
         logger.info("Backup updated successfully")
     except Exception as e:
         logger.error(f"Backup failed: {e}")
+
+async def restore_backup():
+    try:
+        downloaded = await mega_download_file(BACKUP_NAME, BACKUP_NAME)
+        if downloaded:
+            with open(BACKUP_NAME) as f:
+                state = json.load(f)
+            assistant.load_state(state)
+            logger.info("Assistant state restored from backup")
+        else:
+            logger.warning("No backup found to restore")
+    except Exception as e:
+        logger.error(f"Restore backup failed: {e}")
+
+async def save_backup_loop():
+    while True:
+        await save_backup()
+        await asyncio.sleep(3600)  # строго раз в час
 
 
 # ====================== History Load ======================
