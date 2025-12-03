@@ -17,7 +17,10 @@ logger = logging.getLogger("ai_assistant.main")
 PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
 ABLY_API_KEY = os.getenv("ABLY_API_KEY")
-YANDEX_OAUTH_TOKEN = os.getenv("YANDEX_OAUTH_TOKEN")
+
+YANDEX_REFRESH_TOKEN = os.getenv("YANDEX_REFRESH_TOKEN")
+YANDEX_CLIENT_ID = os.getenv("YANDEX_CLIENT_ID")
+YANDEX_CLIENT_SECRET = os.getenv("YANDEX_CLIENT_SECRET")
 
 assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
@@ -38,7 +41,7 @@ async def yandex_worker():
     while True:
         func, args, kwargs, fut = await yandex_queue.get()
         try:
-            result = func(*args, **kwargs)
+            result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
             fut.set_result(result)
         except Exception as e:
             if not fut.done():
@@ -46,34 +49,57 @@ async def yandex_worker():
         finally:
             yandex_queue.task_done()
 
-def ensure_yadisk():
+# --- Token management ---
+async def refresh_yandex_access_token():
+    url = "https://oauth.yandex.com/token"
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": YANDEX_REFRESH_TOKEN,
+        "client_id": YANDEX_CLIENT_ID,
+        "client_secret": YANDEX_CLIENT_SECRET,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, data=data) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                logger.error(f"Failed to refresh Yandex access token: {text}")
+                raise RuntimeError("Failed to refresh Yandex access token")
+            json_resp = await resp.json()
+            access_token = json_resp.get("access_token")
+            logger.info("Yandex access token refreshed")
+            return access_token
+
+async def ensure_yadisk():
     global yadisk_client
     if yadisk_client is None:
-        if not YANDEX_OAUTH_TOKEN:
-            raise RuntimeError("YANDEX_OAUTH_TOKEN not set")
-        yadisk_client = yadisk.YaDisk(token=YANDEX_OAUTH_TOKEN)
-        if not yadisk_client.check_token():
-            raise RuntimeError("Invalid Yandex OAuth token")
+        access_token = await refresh_yandex_access_token()
+        yadisk_client = yadisk.YaDisk(token=access_token)
+
+async def yandex_safe_call(func, *args, **kwargs):
+    await ensure_yadisk()
+    try:
+        return func(*args, **kwargs)
+    except yadisk.exceptions.UnauthorizedError:
+        logger.warning("Access token expired, refreshing...")
+        access_token = await refresh_yandex_access_token()
+        yadisk_client.token = access_token
+        return func(*args, **kwargs)
 
 # --- High-level wrappers ---
 async def yandex_upload(local_path: str, remote_path: str):
-    ensure_yadisk()
-    return await run_yandex_task(yadisk_client.upload, local_path, remote_path, overwrite=True)
+    return await run_yandex_task(yandex_safe_call, yadisk_client.upload, local_path, remote_path, overwrite=True)
 
 async def yandex_download(remote_path: str, local_path: str):
-    ensure_yadisk()
-    return await run_yandex_task(yadisk_client.download, remote_path, local_path)
+    return await run_yandex_task(yandex_safe_call, yadisk_client.download, remote_path, local_path)
 
 async def yandex_rm(remote_path: str):
-    ensure_yadisk()
-    return await run_yandex_task(yadisk_client.remove, remote_path, permanently=True)
+    return await run_yandex_task(yandex_safe_call, yadisk_client.remove, remote_path, permanently=True)
 
 async def yandex_mv(src: str, dst: str):
-    ensure_yadisk()
-    return await run_yandex_task(yadisk_client.move, src, dst, overwrite=True)
+    return await run_yandex_task(yandex_safe_call, yadisk_client.move, src, dst, overwrite=True)
 
 async def yandex_ls():
-    ensure_yadisk()
+    await ensure_yadisk()
     return await run_yandex_task(lambda: list(yadisk_client.listdir("/")))
 
 async def yandex_find(filename: str):
@@ -94,7 +120,6 @@ OLD_BACKUP_NAME = "assistant_backup_old.json"
 async def save_backup():
     try:
         logger.info("Saving backup...")
-
         # удаляем старый старый бэкап
         old_old_path = await yandex_find(OLD_BACKUP_NAME)
         if old_old_path:
