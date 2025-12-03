@@ -8,7 +8,7 @@ import json
 from dotenv import load_dotenv
 from ably import AblyRest
 from model import AIAssistant
-from mega.client import Mega 
+from mega.client import Mega
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -31,10 +31,16 @@ mega_client: Mega | None = None
 mega_logged_in = None
 FOLDER_ID: str | None = None
 
+BACKUP_NAME = "assistant_backup.json"
+OLD_BACKUP_NAME = "assistant_backup_old.json"
+
+CRASH_HISTORY_FILES = ["crash_23k.json"]  # сейчас один файл, позже несколько
+
 async def mega_connect():
     global mega_client, mega_logged_in, FOLDER_ID
     if mega_client is None:
         mega_client = Mega()
+        logger.info("Logging in user...")
         mega_logged_in = await mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
         folders = await mega_logged_in.get_files()
         for k, v in folders.items():
@@ -65,6 +71,8 @@ async def mega_download_file(remote_name: str, local_path: str):
     if file_id:
         await mega_logged_in.download(file_id, local_path)
         logger.info(f"Downloaded {remote_name} from Mega")
+        return True
+    return False
 
 async def mega_delete_file(name: str):
     file_id = await mega_find_file(name)
@@ -78,10 +86,7 @@ async def mega_rename_file(old_name: str, new_name: str):
         await mega_logged_in.rename(file_id, new_name)
         logger.info(f"Renamed {old_name} -> {new_name}")
 
-# ====================== BACKUP ======================
-BACKUP_NAME = "assistant_backup.json"
-OLD_BACKUP_NAME = "assistant_backup_old.json"
-
+# ====================== Backup ======================
 async def save_backup():
     try:
         await mega_connect()
@@ -97,8 +102,8 @@ async def save_backup():
 
         old_file_id = await mega_find_file(OLD_BACKUP_NAME)
         if old_file_id:
-            await mega_logged_in.trash(old_file_id)
-            logger.info("Old backup moved to Trash")
+            await mega_logged_in.delete(old_file_id)
+            logger.info("Old backup removed after upload")
 
         logger.info("Backup updated successfully")
     except Exception as e:
@@ -107,7 +112,7 @@ async def save_backup():
 async def save_backup_loop():
     while True:
         await save_backup()
-        await asyncio.sleep(3600)  # асинхронная пауза
+        await asyncio.sleep(3600)
 
 async def restore_backup():
     try:
@@ -123,28 +128,25 @@ async def restore_backup():
         logger.error(f"Restore error: {e}")
 
 # ====================== History Load ======================
-async def load_big_history(filename="crash_23k.json"):
-    try:
-        file_id = await mega_find_file(filename)
-        if not file_id:
-            return
-
-        logger.info("Downloading history from Mega...")
-        await mega_download_file(filename, filename)
-
+async def load_history_files(files=CRASH_HISTORY_FILES):
+    for filename in files:
+        logger.info(f"Processing history file: {filename}")
+        file_downloaded = await mega_download_file(filename, filename)
+        if not file_downloaded:
+            logger.warning(f"File {filename} not found in Mega")
+            continue
         with open(filename) as f:
             data = json.load(f)
 
         block = 5000
         for i in range(0, len(data), block):
             assistant.load_history_from_list(data[i:i+block])
-            logger.info(f"Loaded block {i}-{min(i+block, len(data))}")
+            logger.info(f"Loaded block {i}-{min(i+block, len(data))} from {filename}")
 
-        logger.info("Full history loaded successfully")
-    except Exception as e:
-        logger.error(f"History load error: {e}")
+        os.remove(filename)
+        logger.info(f"File {filename} removed from local storage")
 
-# ====================== KEEP ALIVE ======================
+# ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
         return
@@ -171,8 +173,8 @@ class FeedbackPayload(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     await restore_backup()
+    await load_history_files()
     asyncio.create_task(save_backup_loop())
-    asyncio.create_task(load_big_history())
     asyncio.create_task(keep_alive_loop())
 
 @app.post("/predict")
