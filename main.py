@@ -84,6 +84,7 @@ async def mega_rename_file(old_name: str, new_name: str):
         await mega_logged_in.rename(file_id, new_name)
         logger.info(f"Renamed {old_name} -> {new_name}")
 
+
 # ====================== Backup ======================
 BACKUP_NAME = "assistant_backup.json"
 OLD_BACKUP_NAME = "assistant_backup_old.json"
@@ -130,6 +131,7 @@ async def save_backup_loop():
 
 # ====================== History Load ======================
 CRASH_HISTORY_FILES = ["crash_23k.json"]
+
 async def load_history_files(files=CRASH_HISTORY_FILES):
     await mega_connect()
     for filename in files:
