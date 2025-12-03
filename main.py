@@ -12,6 +12,7 @@ from model import AIAssistant
 import yadisk  # pip install yadisk
 import ijson  # pip install ijson
 import io
+import ijson.asyncio
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -134,12 +135,13 @@ async def save_backup_loop():
 
 # ====================== History Load ======================
 async def stream_json_from_yadisk(remote_path: str):
-    """Асинхронно итерируем по JSON-массиву с Яндекс.Диска, стримингом прямо из ответа."""
+    """Асинхронно итерируем по JSON-массиву с Яндекс.Диска."""
     download_url = await run_yandex_task(yadisk_client.get_download_link, remote_path)
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
-            async for item in ijson.items_async(resp.content, "item"):
+            # ijson.asyncio.items_async умеет работать с resp.content напрямую
+            async for item in ijson.asyncio.items_async(resp.content, "item"):
                 yield item
 
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
@@ -147,7 +149,7 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
         flag_file = filename + "_processed_flag.json"
         flag_remote = await yandex_find(flag_file)
         if flag_remote:
-            logger.info(f"File {filename} was already processed. Skipping.")
+            logger.info(f"File {filename} was уже processed. Skipping.")
             continue
 
         logger.info(f"Processing history file: {filename}")
