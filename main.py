@@ -18,16 +18,13 @@ PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
 ABLY_API_KEY = os.getenv("ABLY_API_KEY")
 
-YANDEX_REFRESH_TOKEN = os.getenv("YANDEX_REFRESH_TOKEN")
-YANDEX_CLIENT_ID = os.getenv("YANDEX_CLIENT_ID")
-YANDEX_CLIENT_SECRET = os.getenv("YANDEX_CLIENT_SECRET")
-
+YANDEX_ACCESS_TOKEN = os.getenv("YANDEX_ACCESS_TOKEN")
 assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("crash_ai_hud")
 
 # ====================== Yandex Disk ======================
-yadisk_client: yadisk.YaDisk | None = None
+yadisk_client = yadisk.YaDisk(token=YANDEX_ACCESS_TOKEN)
 yandex_queue: asyncio.Queue = asyncio.Queue()
 yandex_worker_task: asyncio.Task | None = None
 
@@ -47,59 +44,23 @@ async def yandex_worker():
             if not fut.done():
                 fut.set_exception(e)
         finally:
-            yandex_queue.task_done()
+            yandex_queue.task_done() 
 
-# --- Token management ---
-async def refresh_yandex_access_token():
-    url = "https://oauth.yandex.com/token"
-    data = {
-        "grant_type": "refresh_token",
-        "refresh_token": YANDEX_REFRESH_TOKEN,
-        "client_id": YANDEX_CLIENT_ID,
-        "client_secret": YANDEX_CLIENT_SECRET,
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=data) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                logger.error(f"Failed to refresh Yandex access token: {text}")
-                raise RuntimeError("Failed to refresh Yandex access token")
-            json_resp = await resp.json()
-            access_token = json_resp.get("access_token")
-            logger.info("Yandex access token refreshed")
-            return access_token
-
-async def ensure_yadisk():
-    global yadisk_client
-    if yadisk_client is None:
-        access_token = await refresh_yandex_access_token()
-        yadisk_client = yadisk.YaDisk(token=access_token)
-
-async def yandex_safe_call(func, *args, **kwargs):
-    await ensure_yadisk()
-    try:
-        return func(*args, **kwargs)
-    except yadisk.exceptions.UnauthorizedError:
-        logger.warning("Access token expired, refreshing...")
-        access_token = await refresh_yandex_access_token()
-        yadisk_client.token = access_token
-        return func(*args, **kwargs)
 
 # --- High-level wrappers ---
 async def yandex_upload(local_path: str, remote_path: str):
-    return await run_yandex_task(yandex_safe_call, yadisk_client.upload, local_path, remote_path, overwrite=True)
+    return await run_yandex_task(yadisk_client.upload, local_path, remote_path, overwrite=True)
 
 async def yandex_download(remote_path: str, local_path: str):
-    return await run_yandex_task(yandex_safe_call, yadisk_client.download, remote_path, local_path)
+    return await run_yandex_task(yadisk_client.download, remote_path, local_path)
 
 async def yandex_rm(remote_path: str):
-    return await run_yandex_task(yandex_safe_call, yadisk_client.remove, remote_path, permanently=True)
+    return await run_yandex_task(yadisk_client.remove, remote_path, permanently=True)
 
 async def yandex_mv(src: str, dst: str):
-    return await run_yandex_task(yandex_safe_call, yadisk_client.move, src, dst, overwrite=True)
+    return await run_yandex_task(yadisk_client.move, src, dst, overwrite=True)
 
 async def yandex_ls():
-    await ensure_yadisk()
     return await run_yandex_task(lambda: list(yadisk_client.listdir("/")))
 
 async def yandex_find(filename: str):
