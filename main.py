@@ -17,7 +17,6 @@ logger = logging.getLogger("ai_assistant.main")
 PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
 ABLY_API_KEY = os.getenv("ABLY_API_KEY")
-
 YANDEX_OAUTH_TOKEN = os.getenv("YANDEX_OAUTH_TOKEN")
 
 assistant = AIAssistant()
@@ -78,7 +77,6 @@ async def yandex_ls():
     return await run_yandex_task(lambda: list(yadisk_client.listdir("/")))
 
 async def yandex_find(filename: str):
-    """Ищем файл в корне. Возвращает путь /filename или None."""
     try:
         items = await yandex_ls()
         for item in items:
@@ -96,26 +94,33 @@ OLD_BACKUP_NAME = "assistant_backup_old.json"
 async def save_backup():
     try:
         logger.info("Saving backup...")
-        existing = await yandex_find(BACKUP_NAME)
-        if existing:
-            old_existing = await yandex_find(OLD_BACKUP_NAME)
-            if old_existing:
-                try:
-                    await yandex_rm(old_existing)
-                    logger.info("Removed previous old backup %s", old_existing)
-                except Exception as e:
-                    logger.warning("Failed to remove previous old backup: %s", e)
-            try:
-                await yandex_mv(existing, "/" + OLD_BACKUP_NAME)
-                logger.info("Renamed current backup %s -> %s", existing, OLD_BACKUP_NAME)
-            except Exception as e:
-                logger.warning("Failed to rename existing backup: %s", e)
 
+        # удаляем старый старый бэкап
+        old_old_path = await yandex_find(OLD_BACKUP_NAME)
+        if old_old_path:
+            try:
+                await yandex_rm(old_old_path)
+                logger.info("Deleted old-old backup %s", old_old_path)
+            except Exception as e:
+                logger.warning("Failed to delete old-old backup: %s", e)
+
+        # переименовываем текущий бэкап в OLD
+        current_path = await yandex_find(BACKUP_NAME)
+        if current_path:
+            try:
+                await yandex_mv(current_path, "/" + OLD_BACKUP_NAME)
+                logger.info("Renamed current backup to old: %s -> %s", current_path, OLD_BACKUP_NAME)
+            except Exception as e:
+                logger.warning("Failed to rename current backup: %s", e)
+
+        # создаём новый локальный бэкап
         with open(BACKUP_NAME, "w") as f:
             json.dump(assistant.export_state(), f)
 
+        # загружаем новый бэкап
         await yandex_upload(BACKUP_NAME, "/" + BACKUP_NAME)
         logger.info("Backup uploaded successfully")
+
     except Exception as e:
         logger.error("Backup failed: %s", e)
 
