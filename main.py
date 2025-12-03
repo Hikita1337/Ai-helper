@@ -27,7 +27,6 @@ ably_client = AblyRest(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("crash_ai_hud")
 
 # ====================== Mega ======================
-from async_mega_py import MegaFile
 
 mega_client: Mega | None = None
 mega_logged_in = None
