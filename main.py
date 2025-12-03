@@ -66,8 +66,7 @@ async def yandex_find(filename: str):
 
 async def yandex_download_stream(remote_path: str, chunk_size: int = 1024*1024):
     """Возвращает асинхронный генератор блоков данных из файла на Яндекс.Диске"""
-    meta = await run_yandex_task(yadisk_client.get_meta, remote_path)
-    download_url = meta.file
+    download_url = yadisk_client.download_url(remote_path)
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
@@ -110,11 +109,9 @@ async def restore_backup():
         remote = await yandex_find(BACKUP_NAME)
         if remote:
             local_path = BACKUP_NAME
-            async with aiohttp.ClientSession() as session:
-                async with session.get(remote) as resp:
-                    content = await resp.read()
-                    async with aiofiles.open(local_path, "wb") as f:
-                        await f.write(content)
+            async with aiofiles.open(local_path, "wb") as f:
+                async for block in yandex_download_stream(remote):
+                    await f.write(block)
             with open(local_path) as f:
                 state = json.load(f)
             assistant.load_state(state)
@@ -123,7 +120,7 @@ async def restore_backup():
             logger.warning("No backup found to restore")
     except Exception as e:
         logger.error("Restore backup failed: %s", e)
-
+        
 async def save_backup_loop():
     while True:
         try:
