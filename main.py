@@ -137,24 +137,27 @@ async def save_backup_loop():
 async def stream_json_from_yadisk(remote_path: str):
     """
     Асинхронно итерируем по JSON-массиву с Яндекс.Диска.
-    Работает с ijson.items_async напрямую, без несуществующих модулей.
+    Возвращает dict для каждой записи в массиве.
     """
     download_url = await run_yandex_task(yadisk_client.get_download_link, remote_path)
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
-            # items_async умеет работать с resp.content напрямую
-            async for item in ijson.items_async(resp.content, "item"):
-                yield item
+            # resp.content — это async-байтовый поток, ijson.items_async умеет его читать
+            async for record in ijson.items_async(resp.content, "item"):
+                yield record
+
 
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
+    """
+    Асинхронно обрабатывает JSON-файлы истории, блоками.
+    Каждый record — dict, как в твоем примере JSON.
+    """
     for filename in files:
         flag_file = filename + "_processed_flag.json"
-
-        # Проверяем, не обработан ли уже файл
         flag_remote = await yandex_find(flag_file)
         if flag_remote:
-            logger.info(f"File {filename} was already processed. Skipping.")
+            logger.info(f"File {filename} already processed. Skipping.")
             continue
 
         logger.info(f"Processing history file: {filename}")
@@ -166,25 +169,25 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
         try:
             batch = []
             async for record in stream_json_from_yadisk(remote):
+                # record здесь dict, можно спокойно делать record.get("game_id") и т.д.
                 batch.append(record)
                 if len(batch) >= block_records:
                     assistant.load_history_from_list(batch)
                     logger.info(f"Loaded block of {len(batch)} records from {filename}")
                     batch.clear()
 
-            # Загружаем остаток
             if batch:
                 assistant.load_history_from_list(batch)
                 logger.info(f"Loaded final block of {len(batch)} records from {filename}")
 
-            # Создаем флаг обработки
+            # Создаём флаг, что обработка завершена
             async with aiofiles.open(flag_file, "w") as f:
                 await f.write(json.dumps({"processed": True}))
             await yandex_upload(flag_file, "/" + flag_file)
             logger.info(f"Processing of {filename} finished. Flag uploaded.")
 
         except Exception as e:
-            logger.error(f"Error processing history file {filename}: {e}")
+            logger.error("Error processing history file %s: %s", filename, e)
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
