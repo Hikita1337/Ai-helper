@@ -20,7 +20,7 @@ ABLY_API_KEY = os.getenv("ABLY_API_KEY")
 
 MEGA_EMAIL = os.getenv("MEGA_EMAIL")
 MEGA_PASSWORD = os.getenv("MEGA_PASSWORD")
-MEGA_FOLDER = "crashAi_backup"
+
 
 assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
@@ -29,15 +29,15 @@ ably_channel = ably_client.channels.get("crash_ai_hud")
 # ====================== Mega ======================
 mega_client: Mega | None = None
 mega_logged_in = None
-FOLDER_ID: str | None = None
 
 async def mega_connect():
-    global mega_client, mega_logged_in, FOLDER_ID
+    global mega_client, mega_logged_in
     if mega_client is None:
         mega_client = Mega()
         logger.info("Logging in to Mega...")
         mega_logged_in = await mega_client.login(MEGA_EMAIL, MEGA_PASSWORD)
-
+        logger.info("Mega connected")
+        
         nodes = await mega_logged_in.get_files()
         # ищем папку для бэкапов
         for node_id, node in nodes.items():
@@ -57,19 +57,19 @@ async def mega_find_file(name: str):
     nodes = await mega_logged_in.get_files()
     for node_id, node in nodes.items():
         if node.get("name") == name:
-            return node["h"]
+            return node.get("h")  # handle файла
     return None
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
-    await mega_logged_in.upload(local_path, parent=FOLDER_ID)
+    await mega_logged_in.upload(local_path)  # загружает в корень
     logger.info(f"Uploaded {local_path} to Mega")
-
+    
 async def mega_download_file(remote_name: str, local_path: str):
     await mega_connect()
-    file_id = await mega_find_file(remote_name)
-    if file_id:
-        await mega_logged_in.download(file_id, local_path)
+    file_handle = await mega_find_file(remote_name)
+    if file_handle:
+        await mega_logged_in.download(file_handle, local_path)
         logger.info(f"Downloaded {remote_name} from Mega")
         return True
     return False
