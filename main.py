@@ -3,8 +3,8 @@ from pydantic import BaseModel
 import os
 import logging
 import asyncio
-import aiofiles
 import aiohttp
+import aiofiles
 import json
 from dotenv import load_dotenv
 from ably import AblyRest
@@ -18,8 +18,8 @@ logger = logging.getLogger("ai_assistant.main")
 PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
 ABLY_API_KEY = os.getenv("ABLY_API_KEY")
-
 YANDEX_ACCESS_TOKEN = os.getenv("YANDEX_ACCESS_TOKEN")
+
 assistant = AIAssistant()
 ably_client = AblyRest(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("crash_ai_hud")
@@ -45,21 +45,10 @@ async def yandex_worker():
             if not fut.done():
                 fut.set_exception(e)
         finally:
-            yandex_queue.task_done() 
+            yandex_queue.task_done()
 
-
-# --- High-level wrappers ---
 async def yandex_upload(local_path: str, remote_path: str):
     return await run_yandex_task(yadisk_client.upload, local_path, remote_path, overwrite=True)
-
-async def yandex_download(remote_path: str, local_path: str):
-    return await run_yandex_task(yadisk_client.download, remote_path, local_path)
-
-async def yandex_rm(remote_path: str):
-    return await run_yandex_task(yadisk_client.remove, remote_path, permanently=True)
-
-async def yandex_mv(src: str, dst: str):
-    return await run_yandex_task(yadisk_client.move, src, dst, overwrite=True)
 
 async def yandex_ls():
     return await run_yandex_task(lambda: list(yadisk_client.listdir("/")))
@@ -75,6 +64,16 @@ async def yandex_find(filename: str):
         logger.error("Yandex find error: %s", e)
         return None
 
+async def yandex_download_stream(remote_path: str, chunk_size: int = 1024*1024):
+    """Возвращает асинхронный генератор блоков данных из файла на Яндекс.Диске"""
+    meta = await run_yandex_task(yadisk_client.get_meta, remote_path)
+    download_url = meta.file
+    async with aiohttp.ClientSession() as session:
+        async with session.get(download_url) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.content.iter_chunked(chunk_size):
+                yield chunk
+
 # ====================== Backup logic ======================
 BACKUP_NAME = "assistant_backup.json"
 OLD_BACKUP_NAME = "assistant_backup_old.json"
@@ -82,32 +81,26 @@ OLD_BACKUP_NAME = "assistant_backup_old.json"
 async def save_backup():
     try:
         logger.info("Saving backup...")
-        # удаляем старый старый бэкап
         old_old_path = await yandex_find(OLD_BACKUP_NAME)
         if old_old_path:
             try:
-                await yandex_rm(old_old_path)
+                await run_yandex_task(yadisk_client.remove, old_old_path, permanently=True)
                 logger.info("Deleted old-old backup %s", old_old_path)
             except Exception as e:
                 logger.warning("Failed to delete old-old backup: %s", e)
 
-        # переименовываем текущий бэкап в OLD
         current_path = await yandex_find(BACKUP_NAME)
         if current_path:
             try:
-                await yandex_mv(current_path, "/" + OLD_BACKUP_NAME)
+                await run_yandex_task(yadisk_client.move, current_path, "/" + OLD_BACKUP_NAME, overwrite=True)
                 logger.info("Renamed current backup to old: %s -> %s", current_path, OLD_BACKUP_NAME)
             except Exception as e:
                 logger.warning("Failed to rename current backup: %s", e)
 
-        # создаём новый локальный бэкап
         with open(BACKUP_NAME, "w") as f:
             json.dump(assistant.export_state(), f)
-
-        # загружаем новый бэкап
         await yandex_upload(BACKUP_NAME, "/" + BACKUP_NAME)
         logger.info("Backup uploaded successfully")
-
     except Exception as e:
         logger.error("Backup failed: %s", e)
 
@@ -116,8 +109,13 @@ async def restore_backup():
         logger.info("Restoring backup if exists...")
         remote = await yandex_find(BACKUP_NAME)
         if remote:
-            await yandex_download(remote, BACKUP_NAME)
-            with open(BACKUP_NAME) as f:
+            local_path = BACKUP_NAME
+            async with aiohttp.ClientSession() as session:
+                async with session.get(remote) as resp:
+                    content = await resp.read()
+                    async with aiofiles.open(local_path, "wb") as f:
+                        await f.write(content)
+            with open(local_path) as f:
                 state = json.load(f)
             assistant.load_state(state)
             logger.info("Assistant state restored from backup")
@@ -134,46 +132,58 @@ async def save_backup_loop():
             logger.error("save_backup_loop error: %s", e)
         await asyncio.sleep(3600)
 
-# ====================== History Load ======================
-async def yandex_download_stream(remote_path: str, local_path: str):
-    """Скачивает файл из Яндекс.Диска потоково, чтобы не падало на больших файлах"""
-    meta = await run_yandex_task(yadisk_client.get_meta, remote_path)
-    download_url = meta.file  # прямая ссылка на файл
-
-    async with aiohttp.ClientSession() as session:
-        async with session.get(download_url) as resp:
-            resp.raise_for_status()
-            async with aiofiles.open(local_path, "wb") as f:
-                async for chunk in resp.content.iter_chunked(1024 * 1024):  # по 1 МБ
-                    await f.write(chunk)
-    return local_path
-
-
+# ====================== History Load с флагом ======================
 CRASH_HISTORY_FILES = ["crash_23k.json"]
 
-async def load_history_files(files=CRASH_HISTORY_FILES):
+async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
     await asyncio.sleep(0.1)
     for filename in files:
+        flag_file = filename + "_processed_flag.json"
+        flag_remote = await yandex_find(flag_file)
+        if flag_remote:
+            logger.info(f"File {filename} was already processed. Skipping.")
+            continue
+
         logger.info(f"Processing history file: {filename}")
         remote = await yandex_find(filename)
         if not remote:
             logger.warning(f"File {filename} not found in Yandex Disk")
             continue
+
         try:
-            # Скачиваем потоково
-            await yandex_download_stream(remote, filename)
+            # Загружаем и обрабатываем блоками
+            data_buffer = b""
+            json_buffer = []
+            async for block in yandex_download_stream(remote):
+                data_buffer += block
+                try:
+                    partial = json.loads(data_buffer)
+                    if isinstance(partial, list):
+                        json_buffer.extend(partial)
+                        data_buffer = b""
+                except json.JSONDecodeError:
+                    continue
 
-            with open(filename) as f:
-                data = json.load(f)
-            block = 7000
-            for i in range(0, len(data), block):
-                assistant.load_history_from_list(data[i:i+block])
-                logger.info(f"Loaded block {i}-{min(i+block, len(data))} from {filename}")
+                while len(json_buffer) >= block_records:
+                    batch = json_buffer[:block_records]
+                    assistant.load_history_from_list(batch)
+                    logger.info(f"Loaded block of {len(batch)} records from {filename}")
+                    json_buffer = json_buffer[block_records:]
 
-            os.remove(filename)
-            logger.info(f"File {filename} removed from local storage")
+            if json_buffer:
+                assistant.load_history_from_list(json_buffer)
+                logger.info(f"Loaded final block of {len(json_buffer)} records from {filename}")
+
+            # Создаём флаг, что обработка завершена
+            async with aiofiles.open(flag_file, "w") as f:
+                await f.write(json.dumps({"processed": True}))
+            await yandex_upload(flag_file, "/" + flag_file)
+            os.remove(flag_file)
+            logger.info(f"Processing of {filename} finished. Flag uploaded.")
+
         except Exception as e:
             logger.error("Error processing history file %s: %s", filename, e)
+
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
