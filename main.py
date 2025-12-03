@@ -43,14 +43,20 @@ async def mega_connect():
 async def mega_find_file(name: str):
     await mega_connect()
     nodes = await mega_logged_in.get_files()
+    found = None
     for node_id, node in nodes.items():
         if isinstance(node, dict):
-            node_name = node.get("a", {}).get("n", "").strip()
-            if node_name == name:
-                return node.get("h")  # handle файла
-    # Для отладки
-    logger.warning(f"File '{name}' not found. Existing files: {[n.get('a', {}).get('n') if isinstance(n, dict) else n for n in nodes.values()]}")
-    return None
+            node_name = node.get("a", {}).get("n", None)
+        else:
+            node_name = None
+        # Логирование для диагностики
+        logger.debug(f"Node id={node_id} type={type(node)} name_attr={node_name!r}")
+        if node_name == name:
+            found = node.get("h") if isinstance(node, dict) else None
+            break
+    if not found:
+        logger.warning(f"File '{name}' not found. Existing entries: {[ (nid, (n.get('a', {}).get('n') if isinstance(n, dict) else None)) for nid,n in nodes.items() ]}")
+    return found
 
 async def mega_upload_file(local_path: str):
     await mega_connect()
