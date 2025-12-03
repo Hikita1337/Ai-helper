@@ -45,7 +45,7 @@ async def mega_connect():
                 FOLDER_ID = node["id"]
                 break
 
-        if not FOLDER_ID:
+if not FOLDER_ID:
     folder = await mega_logged_in.create_folder(MEGA_FOLDER)
     FOLDER_ID = folder.node_id if hasattr(folder, "node_id") else folder["id"]
 
