@@ -138,8 +138,17 @@ async def stream_json_from_yadisk(remote_path: str):
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
-            async for item in ijson.items_async(resp.content, "item"):
-                yield item
+            buffer = b""
+            async for chunk in resp.content.iter_chunked(1024*64):
+                buffer += chunk
+                while True:
+                    try:
+                        for item in ijson.items(io.BytesIO(buffer), "", multiple_values=True):
+                            yield item
+                        buffer = b""
+                        break
+                    except ijson.common.IncompleteJSONError:
+                        break
 
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
     for filename in files:
@@ -175,7 +184,6 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=7000):
 
         except Exception as e:
             logger.error("Error processing history file %s: %s", filename, e)
-
 # ====================== Keep Alive ======================
 async def keep_alive_loop():
     if not SELF_URL:
