@@ -4,9 +4,13 @@
 """
 
 from typing import List, Dict, Any
+import json
 import logging
+import time
+import os
 
 from utils import calculate_net_win, crash_to_color
+from config import ANALYTICS_BACKUP_FILE, BACKUP_FOLDER
 
 logger = logging.getLogger("ai_assistant.analytics")
 
@@ -79,7 +83,7 @@ def compute_net_wins(user_results: List[Dict[str, Any]]) -> Dict[int, float]:
     for u in user_results:
         uid = u.get("user_id")
         coef = u.get("coefficient")
-        amt = u.get("amount", 0.0)  # предполагаем, что в user_results есть amount
+        amt = u.get("amount", 0.0)
         net_wins[uid] = calculate_net_win(amt, coef)
     return net_wins
 
@@ -90,3 +94,39 @@ def annotate_crash_colors(crash: float) -> str:
       1.00-1.19: красный, 1.2-1.99: синий, 2-3.99: розовый, 4-7.99: зеленый, 8-24.99: желтый, 25+: градиент
     """
     return crash_to_color(crash)
+
+
+# -------------------------
+# Функции для сохранения состояния аналитики
+# -------------------------
+def save_analytics_state(state: Dict[str, Any]):
+    """
+    Сохраняет текущее состояние аналитики в файл бэкапа
+    """
+    try:
+        os.makedirs(BACKUP_FOLDER, exist_ok=True)
+        backup_path = os.path.join(BACKUP_FOLDER, ANALYTICS_BACKUP_FILE)
+        with open(backup_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "state": state,
+                "timestamp": time.time()
+            }, f)
+        logger.info("Analytics state saved to %s", backup_path)
+    except Exception as e:
+        logger.exception("Failed to save analytics state: %s", e)
+
+
+def load_analytics_state() -> Dict[str, Any]:
+    """
+    Загружает состояние аналитики из файла бэкапа
+    """
+    try:
+        backup_path = os.path.join(BACKUP_FOLDER, ANALYTICS_BACKUP_FILE)
+        if not os.path.exists(backup_path):
+            return {}
+        with open(backup_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("state", {})
+    except Exception as e:
+        logger.exception("Failed to load analytics state: %s", e)
+        return {}
