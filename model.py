@@ -19,16 +19,25 @@ def clamp(v, a, b):
     return max(a, min(b, v))
 
 
-def assign_color(crash_value: float) -> str:
-    if crash_value < 1.2:
+def crash_to_color(crash: float) -> str:
+    """
+    Преобразует значение краша в цветовой bucket:
+    1.00 - 1.19: red
+    1.20 - 1.99: blue
+    2.00 - 3.99: pink
+    4.00 - 7.99: green
+    8.00 - 24.99: yellow
+    25+: gradient
+    """
+    if crash < 1.2:
         return "red"
-    elif crash_value < 2:
+    elif crash < 2.0:
         return "blue"
-    elif crash_value < 4:
+    elif crash < 4.0:
         return "pink"
-    elif crash_value < 8:
+    elif crash < 8.0:
         return "green"
-    elif crash_value < 25:
+    elif crash < 25.0:
         return "yellow"
     else:
         return "gradient"
@@ -141,12 +150,10 @@ class AIAssistant:
         if nickname:
             st["nickname"] = nickname
 
-        # Track active users in memory
         if user_id not in self.active_users_queue:
             self.active_users_queue.append(user_id)
 
     def prune_inactive_users(self, cutoff_seconds: int):
-        """Удаляем из RAM пользователей, которые не активны больше cutoff_seconds"""
         now = time.time()
         removed = 0
         for uid in list(self.active_users_queue):
@@ -191,6 +198,22 @@ class AIAssistant:
         }
 
     # -------------------------
+    # Color sequence & pattern search
+    # -------------------------
+    def add_color_to_sequence(self, crash_value: float):
+        color_bucket = crash_to_color(crash_value)
+        self.color_sequence.append(color_bucket)
+
+    def find_color_pattern(self, pattern: list[str]) -> int:
+        seq = list(self.color_sequence)
+        count = 0
+        pat_len = len(pattern)
+        for i in range(len(seq) - pat_len + 1):
+            if seq[i:i + pat_len] == pattern:
+                count += 1
+        return count
+
+    # -------------------------
     # Prediction
     # -------------------------
     def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -203,9 +226,12 @@ class AIAssistant:
                 except Exception:
                     bets = []
 
-            features = self._features_from_game({"bets": bets,
-                                                "num_players": len(bets),
-                                                "color_bucket": None})
+            features = self._features_from_game({
+                "bets": bets,
+                "num_players": len(bets),
+                "color_bucket": None
+            })
+
             med_pred = None
             try:
                 med_pred = float(self.model_med.predict(pd.DataFrame([features]))[0])
@@ -214,6 +240,13 @@ class AIAssistant:
                 hist_crashes = [h["crash"] for h in list(self.history_deque) if h.get("crash")]
                 hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
                 med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
+
+            # ---- color pattern correction ----
+            color_weight = 0.05
+            pattern = ["green", "pink", "red"]
+            pattern_count = self.find_color_pattern(pattern)
+            if pattern_count > 0:
+                med_pred += color_weight * (pattern_count / 10.0)
 
             safe = clamp(med_pred * 0.88, 1.01, med_pred)
             risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
@@ -236,7 +269,6 @@ class AIAssistant:
             if len(self.pred_log) > self.pred_log_len:
                 self.pred_log.popleft()
 
-            # Update success rate and avg error
             for coef in ["safe", "med", "risk", "recommended"]:
                 result[f"success_rate_{coef}"] = self._success_rate(coef)
                 avg_err = self.last_metrics.get(f"avg_error_{coef}", None)
@@ -269,10 +301,13 @@ class AIAssistant:
                     taken_coef = auto
                 self._record_user_bet(uid, amt, auto, taken_coef, ts_now, nickname=nickname)
 
+        # Обновляем color_sequence
+        if crash is not None:
+            self.add_color_to_sequence(crash)
+
         features = self._features_from_game({"bets": bets or [], "num_players": len(bets or []), "color_bucket": None})
         self.training_buffer.append({"features": features, "target": float(crash)})
 
-        # Обновление фактического значения и ошибок
         last_pred = None
         for p in reversed(self.pred_log):
             if p.get("game_id") == game_id:
