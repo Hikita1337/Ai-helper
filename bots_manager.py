@@ -10,7 +10,6 @@ import json
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any
-
 from config import BOTS_FILE, BACKUP_FOLDER, MAX_ACTIVE_USERS, MAX_BOTS_IN_MEMORY, BOT_INACTIVE_DAYS
 from utils import yandex_find, yandex_download_to_file, yandex_upload, calculate_net_win
 
@@ -130,3 +129,25 @@ class BotsManager:
             "bots_in_memory": len(self.bots),
             "active_users_in_memory": len(self.active_users)
         }
+    async def save_ai_state(self, assistant, filename="assistant_state.json"):
+    """Сохраняет полное состояние AIAssistant"""
+        async with self._lock:
+        state = assistant.export_state()
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        await yandex_upload(filename, self.remote_path.replace(BOTS_FILE, filename), overwrite=True)
+        logger.info("Saved full AIAssistant state to disk/remote")
+
+    async def load_ai_state(self, assistant, filename="assistant_state.json"):
+    """Загружает полное состояние AIAssistant"""
+        async with self._lock:
+        try:
+            local_file = filename
+            remote_file = self.remote_path.replace(BOTS_FILE, filename)
+            await yandex_download_to_file(remote_file, local_file)
+            with open(local_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            assistant.load_state(state)
+            logger.info("Loaded full AIAssistant state from disk/remote")
+        except Exception as e:
+            logger.exception("Failed to load AIAssistant state: %s", e)
