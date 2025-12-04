@@ -1,404 +1,458 @@
 # model.py
+import os
 import time
+import math
+import json
+import joblib
+import logging
+from collections import deque, Counter, defaultdict
+from typing import List, Dict, Any
+
 import numpy as np
 import pandas as pd
-from collections import Counter, deque, defaultdict
-import logging
 from lightgbm import LGBMRegressor
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 logger = logging.getLogger("ai_assistant.model")
 logger.setLevel(logging.INFO)
 
+
+def clamp(v, a, b):
+    return max(a, min(b, v))
+
+
 class AIAssistant:
+    """
+    Лёгкая, ресурс-ориентированная реализация помощника.
+    Основные цели:
+      - не раздувать память (ограниченные deque'ы для истории/предсказаний/трейна),
+      - давать рабочие предсказания без тяжёлого ML;
+      - сохранять компактное состояние через export_state/load_state.
+    """
+
     def __init__(self,
-                 color_seq_len=50,
-                 pred_log_len=1000,
-                 pending_threshold=50,
-                 retrain_min_minutes=10):
-        # История/статистика
-        self.history_df = pd.DataFrame()
-        self.crash_values = []
-        self.games_index = set()
-
-        # Пользователи / боты / паттерны
-        self.user_counts = Counter()           # сколько раз встречался uid
-        self.bot_patterns = defaultdict(list)  # uid -> список {amount, auto, crash}
-        self.color_counts = Counter()
-        self.color_sequence = deque(maxlen=color_seq_len)
-
-        # Лог предсказаний
-        self.pred_log = deque(maxlen=pred_log_len)
-
-        # Модели LightGBM
-        self.model_safe = LGBMRegressor(n_estimators=100, verbose=-1)
-        self.model_med  = LGBMRegressor(n_estimators=100, verbose=-1)
-        self.model_risk = LGBMRegressor(n_estimators=100, verbose=-1)
-
-        # Онлайн-обучение / throttle
-        self.pending_feedback = []
+                 color_seq_len: int = 4000,
+                 pred_log_len: int = 2000,
+                 pending_threshold: int = 50,
+                 retrain_min_minutes: int = 10,
+                 max_history_records: int = 50000,
+                 max_training_buffer: int = 50000):
+        # Параметры
+        self.color_seq_len = color_seq_len
+        self.pred_log_len = pred_log_len
         self.pending_threshold = pending_threshold
-        self.last_trained_at = 0
         self.retrain_min_seconds = retrain_min_minutes * 60
 
-        # Метрики истории тренировки
-        self.last_metrics = {}
+        # Ограниченные буферы
+        self.color_sequence = deque(maxlen=color_seq_len)            # последовательность цветов (для pattern)
+        self.history_deque = deque(maxlen=max_history_records)       # recent games (compact dicts)
+        self.pred_log = deque(maxlen=pred_log_len)                  # последние предсказания
 
-def get_pred_log(self, limit: int = 20):
+        # Пользовательская статистика (агрегаты)
+        # user_stats[user_id] = {'count', 'total_amount', 'avg_auto', 'last_active', 'wins', 'losses', 'total_win'}
+        self.user_stats = defaultdict(lambda: {
+            "count": 0,
+            "total_amount": 0.0,
+            "avg_auto": 0.0,
+            "last_active": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_win": 0.0
+        })
+
+        # Набор выявленных ботов (user_id)
+        self.bot_set = set()
+
+        # Модели (light-weight)
+        # модель предсказывает численное значение crash
+        self.model_med = LGBMRegressor(n_estimators=80, verbose=-1)
+        self.model_safe = None  # можем сохранять дополнительные модели при необходимости
+        self.model_risk = None
+
+        # Буфер для онлайн-обучения: список dict {'features':..., 'target': crash}
+        self.training_buffer = deque(maxlen=max_training_buffer)
+
+        # Метрики/статистика
+        self.last_trained_at = 0
+        self.last_metrics = {}
+        self.total_processed_games = 0
+
+        # Доп. параметры
+        self.max_active_users_to_cache = 5000  # можно менять
+        self.min_train_samples = 200           # сколько примеров нужно для обучения
+
+        logger.info("AIAssistant initialized")
+
+    # -------------------------
+    # State (backup/restore)
+    # -------------------------
+    def export_state(self) -> Dict[str, Any]:
         """
-        Возвращает последние `limit` предсказаний.
-        Если pred_log ещё не создан, возвращает пустой список.
+        Возвращает компактный JSON-сериализуемый снимок состояния.
+        Не встраивает большие массивы данных.
         """
-        try:
-            return self.pred_log[-limit:] if hasattr(self, 'pred_log') else []
-        except Exception:
-            return []
-            
-def get_status(self):
-    
-    return {
-        "total_games": len(self.games_index),
-        "pred_log_len": len(self.pred_log),
-        "total_users": len(self.user_counts),
-        "total_bot_patterns": len(self.bot_patterns)
-    }
-    
-    # -------------------- Экспорт/импорт состояния --------------------
-    def export_state(self):
         state = {
-            "crash_values": self.crash_values,
-            "user_counts": dict(self.user_counts),
-            "bot_patterns": {k: v for k, v in self.bot_patterns.items()},
-            "color_sequence": list(self.color_sequence),
-            "history_index": list(self.games_index),
-            "last_trained_at": self.last_trained_at,
-            "last_metrics": self.last_metrics
+            "pred_log": list(self.pred_log),  # последние предсказания (целые/float -> json ok)
+            "last_metrics": self.last_metrics,
+            "total_processed_games": int(self.total_processed_games),
+            # бот-лист (ограниченный размер)
+            "bot_list": list(sorted(list(self.bot_set)))[:5000],
+            # user summary (только ключи и небольшая статистика для быстрого восстановления)
+            "user_summary_count": len(self.user_stats),
+            # color sequence tail (оставим компактно — последние N цветов)
+            "color_tail": list(self.color_sequence)[-1000:],  # 1000 последних цветов
+            "timestamp": time.time()
         }
         return state
 
-    def load_state(self, state: dict):
-        self.crash_values = list(state.get("crash_values", []))
-        self.user_counts = Counter(state.get("user_counts", {}))
-        bp = state.get("bot_patterns", {})
-        self.bot_patterns = defaultdict(list, {int(k): v for k, v in bp.items()})
-        self.color_sequence = deque(state.get("color_sequence", []), maxlen=self.color_sequence.maxlen)
-        self.games_index = set(state.get("history_index", []))
-        self.last_trained_at = state.get("last_trained_at", 0)
-        self.last_metrics = state.get("last_metrics", {})
-        logger.info("State loaded into assistant")
-
-    # -------------------- Загрузка истории --------------------
-    def load_history_from_list(self, games_list):
-        rows = []
-        count_added = 0
-        for item in games_list:
-            gid = item.get("game_id") or item.get("id")
-            if gid is None or gid in self.games_index:
-                continue
-            self.games_index.add(gid)
-            crash = float(item.get("crash") or 0)
-            bets = item.get("bets") or []
-            deposit_sum = item.get("deposit_sum")
-            num_players = item.get("num_players")
-
-            bucket = item.get("color_bucket") or self._bucket_by_crash(crash)
-            rows.append({
-                "game_id": gid,
-                "crash": crash,
-                "bets": bets,
-                "deposit_sum": deposit_sum,
-                "num_players": num_players,
-                "color_bucket": bucket
-            })
-
-            # update stats
-            self.crash_values.append(crash)
-            if bucket:
-                self.color_counts[bucket] += 1
-                self.color_sequence.append(bucket)
-
-            for b in bets:
-                uid = b.get("user_id")
-                if uid is not None:
-                    self.user_counts[uid] += 1
-                    self.bot_patterns[int(uid)].append({
-                        "amount": float(b.get("amount") or 0),
-                        "auto": float(b.get("auto") or 0) if b.get("auto") is not None else 0.0,
-                        "crash": crash
-                    })
-            count_added += 1
-
-        if rows:
-            self.history_df = pd.concat([self.history_df, pd.DataFrame(rows)], ignore_index=True)
-        logger.info(f"Loaded {count_added} new games; total games: {len(self.history_df)}")
-
-    # -------------------- Базовая детекция ботов --------------------
-    def detect_bots_in_snapshot(self, bets):
-        if not bets:
-            return 0.0, []
-        bot_ids = []
-        total_amount = 0.0
-        bot_amount = 0.0
-        for b in bets:
-            uid = b.get("user_id")
-            amt = float(b.get("amount") or 0)
-            total_amount += amt
-            if uid is None:
-                continue
-            # порог: пользователь считается "подозрительным" если он встречался >= threshold раз
-            threshold = max(5, int(np.sqrt(max(1, len(self.history_df)))))
-            if self.user_counts.get(int(uid), 0) >= threshold:
-                bot_ids.append(int(uid))
-                bot_amount += amt
-        frac_amount = (bot_amount / total_amount) if total_amount > 0 else 0.0
-        return frac_amount, bot_ids
-
-    # -------------------- Цветовая логика --------------------
-    @staticmethod
-    def _bucket_by_crash(crash):
+    def load_state(self, state: Dict[str, Any]):
+        """
+        Восстанавливает минимальное состояние.
+        Не пытаемся восстановить тяжёлые структуры — они будут собраны при работе.
+        """
         try:
-            c = float(crash)
-        except:
-            return None
-        if c < 1.2: return "red"
-        if c < 2.0: return "blue"
-        if c < 4.0: return "pink"
-        if c < 8.0: return "green"
-        if c < 25.0: return "yellow"
-        return "gradient"
+            pred_log = state.get("pred_log", [])
+            self.pred_log = deque(pred_log, maxlen=self.pred_log_len)
+            self.last_metrics = state.get("last_metrics", {})
+            self.total_processed_games = int(state.get("total_processed_games", 0))
+            bot_list = state.get("bot_list", [])
+            self.bot_set = set(bot_list)
+            color_tail = state.get("color_tail", [])
+            self.color_sequence = deque(color_tail, maxlen=self.color_seq_len)
+            logger.info("State loaded into assistant")
+        except Exception as e:
+            logger.exception("Failed to load state: %s", e)
 
-    def _color_features(self):
-        categories = ["red","blue","pink","green","yellow","gradient"]
-        counts = Counter(self.color_sequence)
-        total = max(1, len(self.color_sequence))
-        freq = [counts.get(c,0)/total for c in categories]
+    # -------------------------
+    # Utilities: features / scoring
+    # -------------------------
+    def _record_user_bet(self, user_id: int, amount: float, auto: float, taken_coef: float | None, ts: float):
+        st = self.user_stats[user_id]
+        st["count"] += 1
+        st["total_amount"] += float(amount or 0.0)
+        # incremental avg
+        prev_avg = st["avg_auto"]
+        st["avg_auto"] = ((prev_avg * (st["count"] - 1)) + (auto or 0.0)) / st["count"]
+        st["last_active"] = max(st["last_active"], ts)
+        if taken_coef:
+            st["wins"] += 1
+            st["total_win"] += max(0.0, (float(taken_coef) - 1.0) * float(amount))
+        else:
+            st["losses"] += 1
 
-        # transitions 6x6 flattened
-        transitions = Counter()
-        seq = list(self.color_sequence)
-        for i in range(len(seq)-1):
-            transitions[(seq[i], seq[i+1])] += 1
-        total_trans = max(1, sum(transitions.values()))
-        trans_feats = []
-        for a in categories:
-            for b in categories:
-                trans_feats.append(transitions.get((a,b),0)/total_trans)
-        return freq + trans_feats
+    def _features_from_game(self, game: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Собирает простые признаки из записи игры для предсказания:
+          - avg_auto, total_amount, num_players, bot_fraction, color_index
+        """
+        num_players = float(game.get("num_players", 0)) or 0.0
+        # bets может быть списком или строкой JSON
+        bets = game.get("bets", [])
+        if isinstance(bets, str):
+            try:
+                bets = json.loads(bets)
+            except Exception:
+                bets = []
+        total_amount = 0.0
+        avg_auto = 0.0
+        bot_count = 0
+        for b in bets:
+            amt = float(b.get("amount", 0.0) or 0.0)
+            total_amount += amt
+            auto = float(b.get("auto", 0.0) or 0.0)
+            avg_auto += auto
+            uid = b.get("user_id")
+            if uid in self.bot_set:
+                bot_count += 1
+        avg_auto = (avg_auto / len(bets)) if bets else 0.0
+        bot_fraction = (bot_count / len(bets)) if bets else 0.0
 
-    # -------------------- Фичи по ботам (агрегированная) --------------------
-    def _bot_aggregate_features(self, bot_ids):
-        if not bot_ids:
-            return [0.0]*6  # avg_auto, std_auto, avg_amount, std_amount, avg_frac_of_game, num_bots
-        autos = []
-        amts = []
-        frac_in_game = []
-        for uid in bot_ids:
-            pats = self.bot_patterns.get(int(uid), [])
-            if not pats:
-                continue
-            autos_local = [p.get("auto",0) for p in pats]
-            amts_local  = [p.get("amount",0) for p in pats]
-            autos += autos_local
-            amts += amts_local
-            # доля игр где этот бот участвовал — approximate by count / total_games
-            frac_in_game.append(len(pats) / max(1, len(self.history_df)))
-        if not autos:
-            return [0.0]*6
-        return [
-            float(np.mean(autos)),
-            float(np.std(autos)),
-            float(np.mean(amts)),
-            float(np.std(amts)),
-            float(np.mean(frac_in_game)) if frac_in_game else 0.0,
-            float(len(bot_ids))
-        ]
+        color = game.get("color_bucket", "")
+        # map color to small integer: deterministic hash
+        color_index = (hash(color) % 100) if color else 0
 
-    # -------------------- Подготовка фичей для одной игры --------------------
-    def _make_features_for_game(self, bets):
-        bot_frac, bot_ids = self.detect_bots_in_snapshot(bets)
-        total_bets = sum(float(b.get("amount") or 0) for b in bets)
-        num_bets = len(bets)
-        autos = [float(b.get("auto") or 0) for b in bets if b.get("auto") is not None]
-        avg_auto = float(np.mean(autos)) if autos else 1.0
-
-        color_feats = self._color_features()
-        bot_feats = self._bot_aggregate_features(bot_ids)
-        base = [bot_frac, num_bets, total_bets, avg_auto]
-        return np.array(base + bot_feats + color_feats, dtype=float)
-
-    # -------------------- Предикт и логирование --------------------
-def predict_and_log(self, payload):
-    t0 = time.time()
-    game_id = payload.get("game_id")
-    bets = payload.get("bets") or []
-    fast_game = payload.get("meta", {}).get("fast_game", False)
-
-    X = self._make_features_for_game(bets).reshape(1,-1)
-    try:
-        safe = float(self.model_safe.predict(X))
-        med = float(self.model_med.predict(X))
-        risk = float(self.model_risk.predict(X))
-    except Exception:
-        safe, med, risk = 1.2, 1.5, 2.0
-
-    bot_frac, _ = self.detect_bots_in_snapshot(bets)
-    recommended_pct = max(0.5, 2.0*(1 - bot_frac))
-
-    # Цветовой прогноз
-    if self.color_sequence:
-        color_counts = Counter(self.color_sequence)
-        predicted_color, count = color_counts.most_common(1)[0]
-        color_confidence = count / sum(color_counts.values())
-    else:
-        predicted_color = "unknown"
-        color_confidence = 0.0
-
-    # Запись в лог
-    self.pred_log.append({
-        "game_id": game_id,
-        "safe": round(safe,2),
-        "med": round(med,2),
-        "risk": round(risk,2),
-        "recommended_pct": round(recommended_pct,2),
-        "bot_frac_money": round(bot_frac,3),
-        "num_bets": len(bets),
-        "timestamp": time.time(),
-        "fast_game": bool(fast_game),
-        "predicted_color": predicted_color,          
-        "color_confidence": round(color_confidence,3)
-    })
-
-    logger.info(f"PREDICT game={game_id} safe={safe} med={med} risk={risk} in {time.time()-t0:.3f}s")
-    
-    def get_pred_log(self, limit=20):
-        return list(self.pred_log)[-limit:]
-
-    # -------------------- Обратная связь и онлайн-обучение --------------------
-    def process_feedback(self, game_id, crash, bets=None, deposit_sum=None, num_players=None, fast_game=False):
-        if game_id in self.games_index:
-            logger.debug(f"Feedback for known game {game_id}")
-        self.games_index.add(game_id)
-        self.crash_values.append(float(crash))
-
-        row = {
-            "game_id": game_id,
-            "crash": float(crash),
-            "bets": bets or [],
-            "deposit_sum": deposit_sum,
-            "num_players": num_players,
-            "fast_game": fast_game
+        return {
+            "avg_auto": float(avg_auto),
+            "total_amount": float(total_amount),
+            "num_players": float(num_players),
+            "bot_fraction": float(bot_fraction),
+            "color_index": float(color_index)
         }
 
-        # update user counts and bot patterns
-        for b in row["bets"]:
-            uid = b.get("user_id")
-            if uid is not None:
-                uid = int(uid)
-                self.user_counts[uid] += 1
-                self.bot_patterns[uid].append({
-                    "amount": float(b.get("amount") or 0),
-                    "auto": float(b.get("auto") or 0) if b.get("auto") is not None else 0.0,
-                    "crash": float(crash)
-                })
+    # -------------------------
+    # Loading history (batch)
+    # -------------------------
+    def load_history_from_list(self, games_list: List[Dict[str, Any]]):
+        """
+        Обработка блока игр (вызывается из main.load_history_files).
+        Мы:
+          - собираем компактную историю (ограниченная deque),
+          - обновляем статистики по пользователям,
+          - добавляем в буфер обучения примеры (если есть crash),
+          - отмечаем цветовую последовательность.
+        """
+        added = 0
+        ts_now = time.time()
+        for g in games_list:
+            try:
+                game_id = g.get("game_id") or g.get("id")
+                # нормализуем bets
+                bets = g.get("bets", [])
+                if isinstance(bets, str):
+                    try:
+                        bets = json.loads(bets)
+                    except Exception:
+                        bets = []
+                g["bets"] = bets
 
-        self.history_df = pd.concat([self.history_df, pd.DataFrame([row])], ignore_index=True)
-        bucket = row.get("color_bucket") or self._bucket_by_crash(crash)
-        if bucket:
-            self.color_sequence.append(bucket)
+                # add to history (compact)
+                compact = {
+                    "game_id": int(game_id) if game_id is not None else None,
+                    "crash": float(g["crash"]) if g.get("crash") not in (None, "", "null") else None,
+                    "color_bucket": g.get("color_bucket"),
+                    "num_players": int(g.get("num_players") or 0)
+                }
+                self.history_deque.append(compact)
+                self.total_processed_games += 1
+                # colors
+                if compact["color_bucket"]:
+                    self.color_sequence.append(compact["color_bucket"])
 
-        # enqueue feedback for retrain
-        self.pending_feedback.append(row)
+                # update user stats from bets
+                for b in bets:
+                    uid = b.get("user_id")
+                    amt = float(b.get("amount", 0.0) or 0.0)
+                    auto = float(b.get("auto", 0.0) or 0.0)
+                    # taken_coef may be present later (in feedback), here unknown -> None
+                    self._record_user_bet(uid, amt, auto, None, ts_now)
 
-        # throttle training: либо накоплено достаточно, либо прошло времени с последнего тренига
-        now = time.time()
-        if (len(self.pending_feedback) >= self.pending_threshold and
-            (now - self.last_trained_at) > self.retrain_min_seconds):
+                # if crash present, add example to training buffer
+                if compact["crash"] is not None:
+                    features = self._features_from_game({"bets": bets,
+                                                        "num_players": compact["num_players"],
+                                                        "color_bucket": compact["color_bucket"]})
+                    sample = {
+                        "features": features,
+                        "target": float(compact["crash"])
+                    }
+                    self.training_buffer.append(sample)
+                added += 1
+            except Exception as e:
+                logger.exception("Failed to process game in load_history_from_list: %s", e)
+        logger.info("Loaded %d new games; total games: %d", added, self.total_processed_games)
+
+        # Опционально: триггерим обучение, если накопилось достаточно
+        if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
             try:
                 self._online_train()
-                self.pending_feedback.clear()
-                self.last_trained_at = time.time()
             except Exception as e:
                 logger.exception("Online train failed: %s", e)
 
-        if fast_game:
-            logger.info(f"Fast game {game_id} processed (no visible predict)")
-        else:
-            logger.info(f"Feedback processed game {game_id}, crash={crash}")
-
-    # -------------------- Онлайн-обучение (batch на последних N игр) --------------------
-    def _online_train(self, window=200):
-        # Требуем минимум данных
-        if len(self.history_df) < 50:
-            logger.info("Not enough data to train")
-            return
-
-        # Берём последние window игр (или все если меньше)
-        df = self.history_df.tail(window).reset_index(drop=True)
-        features = []
-        safe_targets = []
-        med_targets = []
-        risk_targets = []
-
-        # build dataset
-        for r in df.itertuples():
-            bets = r.bets or []
-            X = self._make_features_for_game(bets)
-            features.append(X)
-            # targets
-            crash_val = float(r.crash)
-            safe_targets.append(np.percentile([crash_val], 50))
-            med_targets.append(np.percentile([crash_val], 75))
-            risk_targets.append(np.percentile([crash_val], 90))
-
-        X = np.vstack(features)
-        y_safe = np.array(safe_targets)
-        y_med = np.array(med_targets)
-        y_risk = np.array(risk_targets)
-
-        # Fit models (lightweight)
+    # -------------------------
+    # Prediction API
+    # -------------------------
+    def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        payload: dict с полями game_id, bets (список)
+        Возвращает и логирует предсказание в self.pred_log.
+        Формирует: safe, med, risk, recommended_pct.
+        """
         try:
-            self.model_safe.fit(X, y_safe)
-            self.model_med.fit(X, y_med)
-            self.model_risk.fit(X, y_risk)
+            game_id = payload.get("game_id")
+            bets = payload.get("bets", [])
+            if isinstance(bets, str):
+                try:
+                    bets = json.loads(bets)
+                except Exception:
+                    bets = []
 
-            # Metrics on train window
-            preds_safe = self.model_safe.predict(X)
-            mae_safe = float(mean_absolute_error(y_safe, preds_safe))
-            rmse_safe = float(np.sqrt(mean_squared_error(y_safe, preds_safe)))
+            features = self._features_from_game({"bets": bets,
+                                                "num_players": len(bets),
+                                                "color_bucket": None})
+            # Predict med
+            med_pred = None
+            try:
+                # модель может быть не обучена
+                med_pred = float(self.model_med.predict(pd.DataFrame([features]))[0])
+                med_pred = max(1.0, med_pred)
+            except Exception:
+                # fallback: простой эвристический прогноз: weighted avg of avg_auto и mean crash history
+                hist_crashes = [h["crash"] for h in list(self.history_deque) if h.get("crash")]
+                hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
+                med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
 
-            self.last_metrics = {
-                "trained_on": int(time.time()),
-                "window": window,
-                "mae_safe": mae_safe,
-                "rmse_safe": rmse_safe,
-                "samples": len(X)
+            # derive safe/risk heuristics
+            safe = clamp(med_pred * 0.88, 1.01, med_pred)   # чуть осторожнее
+            risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
+
+            # recommended_pct: чем выше predicted med and farther from 1, тем меньше рекомендуемый процент.
+            # простая формула: base = 0.05, scale inversely by (med_pred - 1)
+            if med_pred - 1.0 <= 0:
+                recommended_pct = 0.01
+            else:
+                recommended_pct = clamp(0.05 / (med_pred - 1.0), 0.005, 0.2)
+
+            result = {
+                "game_id": game_id,
+                "safe": round(float(safe), 3),
+                "med": round(float(med_pred), 3),
+                "risk": round(float(risk), 3),
+                "recommended_pct": float(round(recommended_pct, 4)),
+                "ts": time.time()
             }
-            logger.info(f"Online training done: samples={len(X)}, mae_safe={mae_safe:.4f}, rmse_safe={rmse_safe:.4f}")
+
+            # log
+            self.pred_log.append(result)
+            return result
         except Exception as e:
-            logger.exception("Training failed: %s", e)
+            logger.exception("predict_and_log failed: %s", e)
+            raise
 
-    # -------------------- Экспериментальные утилиты --------------------
-    def estimate_color_probs(self):
-        if not self.crash_values:
-            return {}
-        arr = np.array(self.crash_values)
-        buckets = {
-            "red": (arr < 1.2).sum(),
-            "blue": ((arr >= 1.2) & (arr < 2)).sum(),
-            "pink": ((arr >= 2) & (arr < 4)).sum(),
-            "green": ((arr >= 4) & (arr < 8)).sum(),
-            "yellow": ((arr >= 8) & (arr < 25)).sum(),
-            "gradient": (arr >= 25).sum()
-        }
-        total = float(len(arr))
-        return {k: round(v/total, 3) for k,v in buckets.items()}
+    # -------------------------
+    # Feedback & online learning
+    # -------------------------
+    def process_feedback(self, game_id: int, crash: float, bets: List[Dict[str, Any]] | None = None):
+        """
+        Добавляет факт завершившейся игры (game_id, crash) в буфер обучения и пересчитывает user stats (дополняет taken_coef).
+        """
+        try:
+            ts_now = time.time()
+            # Уточняем user_stats: пометим у участников их фактический результат
+            if bets:
+                for b in bets:
+                    uid = b.get("user_id")
+                    amt = float(b.get("amount", 0.0) or 0.0)
+                    auto = float(b.get("auto", 0.0) or 0.0)
+                    # taken coefficient: если у игрока есть поле 'coefficient' or 'coefficientAuto' or 'coefficient' maybe None
+                    taken_coef = b.get("coefficient") if b.get("coefficient") not in (None, "", "null") else None
+                    # если нет taken_coef и crash >= auto, можно infer they cashed at auto
+                    if taken_coef is None and auto and crash is not None and crash >= auto:
+                        taken_coef = auto
+                    self._record_user_bet(uid, amt, auto, taken_coef, ts_now)
 
-    # Получение простых метрик
+            # Добавляем пример в training_buffer
+            # features вычислим по bets
+            features = self._features_from_game({"bets": bets or [], "num_players": len(bets or []), "color_bucket": None})
+            sample = {"features": features, "target": float(crash)}
+            self.training_buffer.append(sample)
+
+            # update metrics (simple)
+            # compute last prediction for same game_id if exists and accumulate error
+            last_pred = None
+            for p in reversed(self.pred_log):
+                if p.get("game_id") == game_id:
+                    last_pred = p
+                    break
+            if last_pred:
+                error = abs(last_pred["med"] - crash) / max(1.0, crash)
+                # rolling metric
+                prev = self.last_metrics.get("avg_error", 0.0)
+                count = self.last_metrics.get("count_error", 0)
+                new_avg = (prev * count + error) / (count + 1)
+                self.last_metrics["avg_error"] = new_avg
+                self.last_metrics["count_error"] = count + 1
+
+            # возможно запуск обучения
+            if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
+                try:
+                    self._online_train()
+                except Exception as e:
+                    logger.exception("process_feedback: _online_train failed: %s", e)
+        except Exception as e:
+            logger.exception("process_feedback failed: %s", e)
+            raise
+
+    def _online_train(self):
+        """
+        Быстрое и лёгкое обучение на собранных примерах в training_buffer.
+        Обучаем одну модель (model_med). Храним простые метрики.
+        """
+        try:
+            n = len(self.training_buffer)
+            if n < self.min_train_samples:
+                logger.info("Not enough samples to train: %d/%d", n, self.min_train_samples)
+                return
+
+            logger.info("Starting online train on %d samples", n)
+            # подготовим датафрейм
+            feats = []
+            targets = []
+            for s in self.training_buffer:
+                feats.append(s["features"])
+                targets.append(s["target"])
+            df = pd.DataFrame(feats)
+            y = np.array(targets, dtype=float)
+
+            # simple train/test split for metrics
+            idx = int(len(df) * 0.8)
+            if idx < 20:
+                idx = max(1, int(len(df) * 0.7))
+            X_train = df.iloc[:idx, :].fillna(0.0)
+            y_train = y[:idx]
+            X_val = df.iloc[idx:, :].fillna(0.0)
+            y_val = y[idx:]
+
+            # train
+            self.model_med = LGBMRegressor(n_estimators=100, verbose=-1)
+            self.model_med.fit(X_train, y_train)
+
+            # metrics
+            y_pred = self.model_med.predict(X_val) if len(y_val) > 0 else self.model_med.predict(X_train)
+            rmse = float(np.sqrt(np.mean((y_pred - (y_val if len(y_val) > 0 else y_train)) ** 2)))
+            mae = float(np.mean(np.abs(y_pred - (y_val if len(y_val) > 0 else y_train))))
+            self.last_metrics.update({
+                "rmse": rmse,
+                "mae": mae,
+                "trained_samples": int(len(df)),
+                "trained_at": time.time()
+            })
+            self.last_trained_at = time.time()
+            logger.info("Online training finished. RMSE=%.4f MAE=%.4f samples=%d", rmse, mae, len(df))
+
+            # optionally persist model to disk (keeps backup small; files stored locally)
+            try:
+                fname = "model_med.joblib"
+                joblib.dump(self.model_med, fname, compress=3)
+                self.last_metrics["model_file"] = fname
+            except Exception as e:
+                logger.warning("Failed to save model to disk: %s", e)
+
+        except Exception as e:
+            logger.exception("_online_train failed: %s", e)
+            raise
+
+    # -------------------------
+    # Introspection helpers
+    # -------------------------
+    def get_pred_log(self, limit: int = 20):
+        try:
+            items = list(self.pred_log)[-limit:]
+            # ensure JSON-serializable
+            def norm(x):
+                if isinstance(x, float):
+                    return float(round(x, 6))
+                return x
+            return [{k: (norm(v) if not isinstance(v, (list, dict)) else v) for k, v in it.items()} for it in items]
+        except Exception:
+            return []
+
     def get_status(self):
         return {
-            "games_loaded": len(self.history_df),
-            "unique_users": len(self.user_counts),
-            "pending_feedback": len(self.pending_feedback),
-            "last_trained_at": self.last_trained_at,
+            "total_games": int(self.total_processed_games),
+            "pred_log_len": len(self.pred_log),
+            "total_users": int(len(self.user_stats)),
+            "total_bots": int(len(self.bot_set)),
+            "training_buffer": int(len(self.training_buffer)),
             "last_metrics": self.last_metrics
         }
+
+    # -------------------------
+    # Bot / user helpers (API)
+    # -------------------------
+    def mark_user_as_bot(self, user_id: int):
+        self.bot_set.add(user_id)
+        logger.info("Marked user %s as bot", user_id)
+
+    def unmark_user_as_bot(self, user_id: int):
+        if user_id in self.bot_set:
+            self.bot_set.remove(user_id)
+            logger.info("Unmarked user %s as bot", user_id)
