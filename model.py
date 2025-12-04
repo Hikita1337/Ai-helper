@@ -20,9 +20,6 @@ def clamp(v, a, b):
 
 
 def assign_color(crash_value: float) -> str:
-    """
-    Расчет цвета по крашу
-    """
     if crash_value < 1.2:
         return "red"
     elif crash_value < 2:
@@ -38,14 +35,6 @@ def assign_color(crash_value: float) -> str:
 
 
 class AIAssistant:
-    """
-    Лёгкая, ресурс-ориентированная реализация помощника.
-    Основные цели:
-      - не раздувать память (ограниченные deque'ы для истории/предсказаний/трейна),
-      - давать рабочие предсказания без тяжёлого ML;
-      - сохранять компактное состояние через export_state/load_state.
-    """
-
     def __init__(self,
                  color_seq_len: int = 4000,
                  pred_log_len: int = 2000,
@@ -53,18 +42,15 @@ class AIAssistant:
                  retrain_min_minutes: int = 10,
                  max_history_records: int = 50000,
                  max_training_buffer: int = 50000):
-        # Параметры
         self.color_seq_len = color_seq_len
         self.pred_log_len = pred_log_len
         self.pending_threshold = pending_threshold
         self.retrain_min_seconds = retrain_min_minutes * 60
 
-        # Ограниченные буферы
-        self.color_sequence = deque(maxlen=color_seq_len)            # последовательность цветов (для pattern)
-        self.history_deque = deque(maxlen=max_history_records)       # recent games (compact dicts)
-        self.pred_log = deque(maxlen=pred_log_len)                  # последние предсказания
+        self.color_sequence = deque(maxlen=color_seq_len)
+        self.history_deque = deque(maxlen=max_history_records)
+        self.pred_log = deque(maxlen=pred_log_len)
 
-        # Пользовательская статистика (агрегаты)
         self.user_stats = defaultdict(lambda: {
             "count": 0,
             "total_amount": 0.0,
@@ -76,23 +62,18 @@ class AIAssistant:
             "nickname": ""
         })
 
-        # Набор выявленных ботов (user_id)
         self.bot_set = set()
 
-        # Модели (light-weight)
         self.model_med = LGBMRegressor(n_estimators=80, verbose=-1)
         self.model_safe = None
         self.model_risk = None
 
-        # Буфер для онлайн-обучения: список dict {'features':..., 'target': crash}
         self.training_buffer = deque(maxlen=max_training_buffer)
 
-        # Метрики/статистика
         self.last_trained_at = 0
         self.last_metrics = {}
         self.total_processed_games = 0
 
-        # Доп. параметры
         self.max_active_users_to_cache = 5000
         self.min_train_samples = 200
 
@@ -130,7 +111,7 @@ class AIAssistant:
             logger.exception("Failed to load state: %s", e)
 
     # -------------------------
-    # Utilities: features / scoring
+    # Utilities
     # -------------------------
     def _record_user_bet(self, user_id: int, amount: float, auto: float, taken_coef: float | None, ts: float, nickname: str | None = None):
         st = self.user_stats[user_id]
@@ -178,9 +159,6 @@ class AIAssistant:
             "color_index": float(color_index)
         }
 
-    # -------------------------
-    # Success rate helper
-    # -------------------------
     def _success_rate(self, coef_key: str) -> float:
         successes = 0
         total = 0
@@ -188,13 +166,13 @@ class AIAssistant:
             pred = p.get(coef_key)
             actual = p.get("crash_actual")
             if pred is not None and actual is not None:
-                if pred <= actual:  # ставка успешна
+                if pred <= actual:
                     successes += 1
                 total += 1
         return round((successes / total) * 100, 1) if total else 0.0
 
     # -------------------------
-    # Loading history (batch)
+    # History loader
     # -------------------------
     def load_history_from_list(self, games_list: List[Dict[str, Any]]):
         added = 0
@@ -225,7 +203,6 @@ class AIAssistant:
                 if color_bucket:
                     self.color_sequence.append(color_bucket)
 
-                # update user stats from bets
                 for b in bets:
                     uid = b.get("user_id")
                     amt = float(b.get("amount", 0.0) or 0.0)
@@ -280,7 +257,7 @@ class AIAssistant:
 
             safe = clamp(med_pred * 0.88, 1.01, med_pred)
             risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
-            recommended = clamp(safe + (med_pred - safe) * 0.5, safe, risk)  # рекомендуемый
+            recommended = clamp(safe + (med_pred - safe) * 0.5, safe, risk)
 
             recommended_pct = clamp(0.05 / max(recommended - 1.0, 0.01), 0.005, 0.2)
 
@@ -291,18 +268,23 @@ class AIAssistant:
                 "risk": round(float(risk), 3),
                 "recommended": round(float(recommended), 3),
                 "recommended_pct": float(round(recommended_pct, 4)),
-                "ts": time.time()
+                "ts": time.time(),
+                "crash_actual": None
             }
 
             # сохраняем предсказание
             self.pred_log.append(result)
-            # ограничение последних 75 игр
             if len(self.pred_log) > 75:
                 self.pred_log.popleft()
 
-            # вычисление доли успешных предсказаний
+            # обновление доли успешных предсказаний
             for coef in ["safe", "med", "risk", "recommended"]:
                 result[f"success_rate_{coef}"] = self._success_rate(coef)
+                avg_err = self.last_metrics.get(f"avg_error_{coef}", None)
+                if avg_err is not None:
+                    result[f"avg_error_{coef}"] = round(avg_err, 4)
+                else:
+                    result[f"avg_error_{coef}"] = None
 
             return result
         except Exception as e:
