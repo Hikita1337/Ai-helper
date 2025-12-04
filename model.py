@@ -37,21 +37,26 @@ def assign_color(crash_value: float) -> str:
 class AIAssistant:
     def __init__(self,
                  color_seq_len: int = 4000,
-                 pred_log_len: int = 2000,
+                 pred_log_len: int = 3000,
                  pending_threshold: int = 50,
                  retrain_min_minutes: int = 10,
                  max_history_records: int = 50000,
                  max_training_buffer: int = 50000,
+                 max_active_users: int = 5000,
                  ably_channel: ably.RealtimeChannel | None = None):
         self.color_seq_len = color_seq_len
         self.pred_log_len = pred_log_len
         self.pending_threshold = pending_threshold
         self.retrain_min_seconds = retrain_min_minutes * 60
+        self.max_active_users = max_active_users
 
+        # ---------------- Data structures ----------------
         self.color_sequence = deque(maxlen=color_seq_len)
         self.history_deque = deque(maxlen=max_history_records)
         self.pred_log = deque(maxlen=pred_log_len)
+        self.training_buffer = deque(maxlen=max_training_buffer)
 
+        # Users stats: active users in memory
         self.user_stats = defaultdict(lambda: {
             "count": 0,
             "total_amount": 0.0,
@@ -62,12 +67,15 @@ class AIAssistant:
             "total_win": 0.0,
             "nickname": ""
         })
+        self.active_users_queue = deque(maxlen=max_active_users)
 
+        # Bot tracking
         self.bot_set = set()
 
-        self.model_med = LGBMRegressor(n_estimators=80, verbose=-1)
-        self.training_buffer = deque(maxlen=max_training_buffer)
+        # Model
+        self.model_med = LGBMRegressor(n_estimators=120, verbose=-1)
 
+        # Metrics
         self.last_trained_at = 0
         self.last_metrics = {}
         self.total_processed_games = 0
@@ -82,30 +90,41 @@ class AIAssistant:
     def export_state(self) -> Dict[str, Any]:
         return {
             "pred_log": list(self.pred_log),
+            "training_buffer": list(self.training_buffer),
+            "history_deque": list(self.history_deque),
+            "color_sequence": list(self.color_sequence),
             "last_metrics": self.last_metrics,
-            "total_processed_games": int(self.total_processed_games),
+            "total_processed_games": self.total_processed_games,
             "bot_list": {uid: self.user_stats.get(uid, {}).get("nickname", "") for uid in self.bot_set},
-            "user_summary_count": len(self.user_stats),
-            "color_tail": list(self.color_sequence)[-1000:],
+            "active_users": {uid: self.user_stats[uid] for uid in self.active_users_queue},
             "timestamp": time.time()
         }
 
     def load_state(self, state: Dict[str, Any]):
         try:
             self.pred_log = deque(state.get("pred_log", []), maxlen=self.pred_log_len)
+            self.training_buffer = deque(state.get("training_buffer", []), maxlen=self.training_buffer.maxlen)
+            self.history_deque = deque(state.get("history_deque", []), maxlen=self.history_deque.maxlen)
+            self.color_sequence = deque(state.get("color_sequence", []), maxlen=self.color_seq_len)
             self.last_metrics = state.get("last_metrics", {})
-            self.total_processed_games = int(state.get("total_processed_games", 0))
+            self.total_processed_games = state.get("total_processed_games", 0)
+
             bot_list = state.get("bot_list", {})
             self.bot_set = set(bot_list.keys())
             for uid, nick in bot_list.items():
                 self.user_stats[uid]["nickname"] = nick
-            self.color_sequence = deque(state.get("color_tail", []), maxlen=self.color_seq_len)
-            logger.info("State loaded into assistant")
+
+            active_users = state.get("active_users", {})
+            for uid, stats in active_users.items():
+                self.user_stats[uid] = stats
+                self.active_users_queue.append(uid)
+
+            logger.info("State loaded successfully")
         except Exception as e:
             logger.exception("Failed to load state: %s", e)
 
     # -------------------------
-    # Utilities
+    # User stats management
     # -------------------------
     def _record_user_bet(self, user_id: int, amount: float, auto: float, taken_coef: float | None, ts: float, nickname: str | None = None):
         st = self.user_stats[user_id]
@@ -122,6 +141,25 @@ class AIAssistant:
         if nickname:
             st["nickname"] = nickname
 
+        # Track active users in memory
+        if user_id not in self.active_users_queue:
+            self.active_users_queue.append(user_id)
+
+    def prune_inactive_users(self, cutoff_seconds: int):
+        """Удаляем из RAM пользователей, которые не активны больше cutoff_seconds"""
+        now = time.time()
+        removed = 0
+        for uid in list(self.active_users_queue):
+            last_active = self.user_stats[uid]["last_active"]
+            if now - last_active > cutoff_seconds:
+                self.active_users_queue.remove(uid)
+                removed += 1
+        if removed:
+            logger.info("Pruned %d inactive users from memory", removed)
+
+    # -------------------------
+    # Feature extraction
+    # -------------------------
     def _features_from_game(self, game: Dict[str, Any]) -> Dict[str, float]:
         num_players = float(game.get("num_players", 0)) or 0.0
         bets = game.get("bets", [])
@@ -152,76 +190,8 @@ class AIAssistant:
             "color_index": float(color_index)
         }
 
-    def _success_rate(self, coef_key: str) -> float:
-        successes = 0
-        total = 0
-        for p in self.pred_log:
-            pred = p.get(coef_key)
-            actual = p.get("crash_actual")
-            if pred is not None and actual is not None:
-                if pred <= actual:
-                    successes += 1
-                total += 1
-        return round((successes / total) * 100, 1) if total else 0.0
-
     # -------------------------
-    # History loader
-    # -------------------------
-    def load_history_from_list(self, games_list: List[Dict[str, Any]]):
-        added = 0
-        ts_now = time.time()
-        for g in games_list:
-            try:
-                game_id = g.get("game_id") or g.get("id")
-                bets = g.get("bets", [])
-                if isinstance(bets, str):
-                    try:
-                        bets = json.loads(bets)
-                    except Exception:
-                        bets = []
-                g["bets"] = bets
-
-                crash_val = g.get("crash")
-                color_bucket = assign_color(float(crash_val)) if crash_val not in (None, "", "null") else None
-
-                compact = {
-                    "game_id": int(game_id) if game_id is not None else None,
-                    "crash": float(crash_val) if crash_val not in (None, "", "null") else None,
-                    "color_bucket": color_bucket,
-                    "num_players": int(g.get("num_players") or 0)
-                }
-                self.history_deque.append(compact)
-                self.total_processed_games += 1
-
-                if color_bucket:
-                    self.color_sequence.append(color_bucket)
-
-                for b in bets:
-                    uid = b.get("user_id")
-                    amt = float(b.get("amount", 0.0) or 0.0)
-                    auto = float(b.get("auto", 0.0) or 0.0)
-                    nickname = b.get("nickname")
-                    taken_coef = b.get("coefficient") if b.get("coefficient") not in (None, "", "null") else None
-                    if taken_coef is None and auto and crash_val is not None and crash_val >= auto:
-                        taken_coef = auto
-                    self._record_user_bet(uid, amt, auto, taken_coef, ts_now, nickname=nickname)
-
-                if compact["crash"] is not None:
-                    features = self._features_from_game({"bets": bets,
-                                                         "num_players": compact["num_players"],
-                                                         "color_bucket": compact["color_bucket"]})
-                    sample = {"features": features, "target": float(compact["crash"])}
-                    self.training_buffer.append(sample)
-                added += 1
-            except Exception as e:
-                logger.exception("Failed to process game in load_history_from_list: %s", e)
-        logger.info("Loaded %d new games; total games: %d", added, self.total_processed_games)
-
-        if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
-            self._online_train()
-
-    # -------------------------
-    # Prediction API
+    # Prediction
     # -------------------------
     def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -262,12 +232,11 @@ class AIAssistant:
                 "crash_actual": None
             }
 
-            # сохраняем предсказание
             self.pred_log.append(result)
-            if len(self.pred_log) > 75:
+            if len(self.pred_log) > self.pred_log_len:
                 self.pred_log.popleft()
 
-            # обновление success_rate и avg_error
+            # Update success rate and avg error
             for coef in ["safe", "med", "risk", "recommended"]:
                 result[f"success_rate_{coef}"] = self._success_rate(coef)
                 avg_err = self.last_metrics.get(f"avg_error_{coef}", None)
@@ -333,7 +302,7 @@ class AIAssistant:
         df = pd.DataFrame([{"target": s["target"], **s["features"]} for s in self.training_buffer])
         X = df.drop(columns=["target"])
         y = df["target"]
-        if len(y) >= 5:  # минимум 5 примеров
+        if len(y) >= 5:
             self.model_med.fit(X, y)
             self.last_trained_at = time.time()
             logger.info("Online training completed on %d samples", len(y))
@@ -350,7 +319,8 @@ class AIAssistant:
             "total_games": self.total_processed_games,
             "pred_log_len": len(self.pred_log),
             "last_trained_at": self.last_trained_at,
-            "bot_count": len(self.bot_set)
+            "bot_count": len(self.bot_set),
+            "active_users": len(self.active_users_queue)
         }
 
     def mark_user_as_bot(self, user_id: int):
@@ -358,3 +328,15 @@ class AIAssistant:
 
     def unmark_user_as_bot(self, user_id: int):
         self.bot_set.discard(user_id)
+
+    def _success_rate(self, coef_key: str) -> float:
+        successes = 0
+        total = 0
+        for p in self.pred_log:
+            pred = p.get(coef_key)
+            actual = p.get("crash_actual")
+            if pred is not None and actual is not None:
+                if pred <= actual:
+                    successes += 1
+                total += 1
+        return round((successes / total) * 100, 1) if total else 0.0
