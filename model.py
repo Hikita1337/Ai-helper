@@ -2,7 +2,6 @@ import os
 import time
 import math
 import json
-import joblib
 import logging
 from collections import deque, defaultdict
 from typing import List, Dict, Any
@@ -43,7 +42,7 @@ class AIAssistant:
                  retrain_min_minutes: int = 10,
                  max_history_records: int = 50000,
                  max_training_buffer: int = 50000,
-                 ably_api_key: str | None = None):
+                 ably_channel: ably.RealtimeChannel | None = None):
         self.color_seq_len = color_seq_len
         self.pred_log_len = pred_log_len
         self.pending_threshold = pending_threshold
@@ -67,29 +66,21 @@ class AIAssistant:
         self.bot_set = set()
 
         self.model_med = LGBMRegressor(n_estimators=80, verbose=-1)
-        self.model_safe = None
-        self.model_risk = None
-
         self.training_buffer = deque(maxlen=max_training_buffer)
 
         self.last_trained_at = 0
         self.last_metrics = {}
         self.total_processed_games = 0
 
-        self.max_active_users_to_cache = 5000
-        self.min_train_samples = 200
-
-        # Ably
-        self.ably_client = ably.RestClient(ably_api_key) if ably_api_key else None
-        self.ably_channel = self.ably_client.channels.get("predictions") if self.ably_client else None
+        self.ably_channel = ably_channel
 
         logger.info("AIAssistant initialized")
 
     # -------------------------
-    # State (backup/restore)
+    # State backup/restore
     # -------------------------
     def export_state(self) -> Dict[str, Any]:
-        state = {
+        return {
             "pred_log": list(self.pred_log),
             "last_metrics": self.last_metrics,
             "total_processed_games": int(self.total_processed_games),
@@ -98,20 +89,17 @@ class AIAssistant:
             "color_tail": list(self.color_sequence)[-1000:],
             "timestamp": time.time()
         }
-        return state
 
     def load_state(self, state: Dict[str, Any]):
         try:
-            pred_log = state.get("pred_log", [])
-            self.pred_log = deque(pred_log, maxlen=self.pred_log_len)
+            self.pred_log = deque(state.get("pred_log", []), maxlen=self.pred_log_len)
             self.last_metrics = state.get("last_metrics", {})
             self.total_processed_games = int(state.get("total_processed_games", 0))
             bot_list = state.get("bot_list", {})
             self.bot_set = set(bot_list.keys())
             for uid, nick in bot_list.items():
                 self.user_stats[uid]["nickname"] = nick
-            color_tail = state.get("color_tail", [])
-            self.color_sequence = deque(color_tail, maxlen=self.color_seq_len)
+            self.color_sequence = deque(state.get("color_tail", []), maxlen=self.color_seq_len)
             logger.info("State loaded into assistant")
         except Exception as e:
             logger.exception("Failed to load state: %s", e)
@@ -150,8 +138,7 @@ class AIAssistant:
             total_amount += amt
             auto = float(b.get("auto", 0.0) or 0.0)
             avg_auto += auto
-            uid = b.get("user_id")
-            if uid in self.bot_set:
+            if b.get("user_id") in self.bot_set:
                 bot_count += 1
         avg_auto = (avg_auto / len(bets)) if bets else 0.0
         bot_fraction = (bot_count / len(bets)) if bets else 0.0
@@ -231,116 +218,143 @@ class AIAssistant:
         logger.info("Loaded %d new games; total games: %d", added, self.total_processed_games)
 
         if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
-            try:
-                self._online_train()
-            except Exception as e:
-                logger.exception("Online train failed: %s", e)
+            self._online_train()
 
     # -------------------------
     # Prediction API
     # -------------------------
-  def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        game_id = payload.get("game_id")
-        bets = payload.get("bets", [])
-        if isinstance(bets, str):
-            try:
-                bets = json.loads(bets)
-            except Exception:
-                bets = []
-
-        features = self._features_from_game({"bets": bets,
-                                            "num_players": len(bets),
-                                            "color_bucket": None})
-        med_pred = None
+    def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            med_pred = float(self.model_med.predict(pd.DataFrame([features]))[0])
-            med_pred = max(1.0, med_pred)
-        except Exception:
-            hist_crashes = [h["crash"] for h in list(self.history_deque) if h.get("crash")]
-            hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
-            med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
+            game_id = payload.get("game_id")
+            bets = payload.get("bets", [])
+            if isinstance(bets, str):
+                try:
+                    bets = json.loads(bets)
+                except Exception:
+                    bets = []
 
-        safe = clamp(med_pred * 0.88, 1.01, med_pred)
-        risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
-        recommended = clamp(safe + (med_pred - safe) * 0.5, safe, risk)
-
-        # доверительные проценты для всех коэффициентов
-        coef_values = {"safe": safe, "med": med_pred, "risk": risk, "recommended": recommended}
-        coef_pct = {k: clamp(0.05 / max(v - 1.0, 0.01), 0.005, 0.2) for k, v in coef_values.items()}
-
-        result = {"game_id": game_id, "ts": time.time(), "crash_actual": None}
-        for k in coef_values:
-            result[k] = round(float(coef_values[k]), 3)
-            result[f"{k}_pct"] = float(round(coef_pct[k], 4))
-            result[f"success_rate_{k}"] = self._success_rate(k)
-            avg_err = self.last_metrics.get(f"avg_error_{k}", None)
-            result[f"avg_error_{k}"] = round(avg_err, 4) if avg_err is not None else None
-
-        # сохраняем предсказание
-        self.pred_log.append(result)
-        if len(self.pred_log) > 75:
-            self.pred_log.popleft()
-
-        # публикация в Ably
-        if self.ably_channel:
+            features = self._features_from_game({"bets": bets,
+                                                "num_players": len(bets),
+                                                "color_bucket": None})
+            med_pred = None
             try:
-                self.ably_channel.publish("new_prediction", result)
-            except Exception as e:
-                logger.exception("Ably publish failed: %s", e)
+                med_pred = float(self.model_med.predict(pd.DataFrame([features]))[0])
+                med_pred = max(1.0, med_pred)
+            except Exception:
+                hist_crashes = [h["crash"] for h in list(self.history_deque) if h.get("crash")]
+                hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
+                med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
 
-        return result
-    except Exception as e:
-        logger.exception("predict_and_log failed: %s", e)
-        raise
+            safe = clamp(med_pred * 0.88, 1.01, med_pred)
+            risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
+            recommended = clamp(safe + (med_pred - safe) * 0.5, safe, risk)
+
+            recommended_pct = clamp(0.05 / max(recommended - 1.0, 0.01), 0.005, 0.2)
+
+            result = {
+                "game_id": game_id,
+                "safe": round(float(safe), 3),
+                "med": round(float(med_pred), 3),
+                "risk": round(float(risk), 3),
+                "recommended": round(float(recommended), 3),
+                "recommended_pct": float(round(recommended_pct, 4)),
+                "ts": time.time(),
+                "crash_actual": None
+            }
+
+            # сохраняем предсказание
+            self.pred_log.append(result)
+            if len(self.pred_log) > 75:
+                self.pred_log.popleft()
+
+            # обновление success_rate и avg_error
+            for coef in ["safe", "med", "risk", "recommended"]:
+                result[f"success_rate_{coef}"] = self._success_rate(coef)
+                avg_err = self.last_metrics.get(f"avg_error_{coef}", None)
+                result[f"avg_error_{coef}"] = round(avg_err, 4) if avg_err is not None else None
+
+            if self.ably_channel:
+                try:
+                    self.ably_channel.publish("new_prediction", result)
+                except Exception as e:
+                    logger.exception("Ably publish failed: %s", e)
+
+            return result
+        except Exception as e:
+            logger.exception("predict_and_log failed: %s", e)
+            raise
 
     # -------------------------
     # Feedback & online learning
     # -------------------------
     def process_feedback(self, game_id: int, crash: float, bets: List[Dict[str, Any]] | None = None):
-        try:
-            ts_now = time.time()
-            if bets:
-                for b in bets:
-                    uid = b.get("user_id")
-                    amt = float(b.get("amount", 0.0) or 0.0)
-                    auto = float(b.get("auto", 0.0) or 0.0)
-                    nickname = b.get("nickname")
-                    taken_coef = b.get("coefficient") if b.get("coefficient") not in (None, "", "null") else None
-                    if taken_coef is None and auto and crash is not None and crash >= auto:
-                        taken_coef = auto
-                    self._record_user_bet(uid, amt, auto, taken_coef, ts_now, nickname=nickname)
+        ts_now = time.time()
+        if bets:
+            for b in bets:
+                uid = b.get("user_id")
+                amt = float(b.get("amount", 0.0) or 0.0)
+                auto = float(b.get("auto", 0.0) or 0.0)
+                nickname = b.get("nickname")
+                taken_coef = b.get("coefficient") if b.get("coefficient") not in (None, "", "null") else None
+                if taken_coef is None and auto and crash is not None and crash >= auto:
+                    taken_coef = auto
+                self._record_user_bet(uid, amt, auto, taken_coef, ts_now, nickname=nickname)
 
-            features = self._features_from_game({"bets": bets or [], "num_players": len(bets or []), "color_bucket": None})
-            sample = {"features": features, "target": float(crash)}
-            self.training_buffer.append(sample)
+        features = self._features_from_game({"bets": bets or [], "num_players": len(bets or []), "color_bucket": None})
+        self.training_buffer.append({"features": features, "target": float(crash)})
 
-            last_pred = None
-            for p in reversed(self.pred_log):
-                if p.get("game_id") == game_id:
-                    last_pred = p
-                    break
-            if last_pred:
-                last_pred["crash_actual"] = crash
-                for coef_name in ["safe", "med", "risk", "recommended"]:
-                    last_val = last_pred.get(coef_name)
-                    if last_val:
-                        error = abs(last_val - crash) / max(1.0, crash)
-                        prev = self.last_metrics.get(f"avg_error_{coef_name}", 0.0)
-                        count = self.last_metrics.get(f"count_error_{coef_name}", 0)
-                        new_avg = (prev * count + error) / (count + 1)
-                        self.last_metrics[f"avg_error_{coef_name}"] = new_avg
-                        self.last_metrics[f"count_error_{coef_name}"] = count + 1
+        # Обновление фактического значения и ошибок
+        last_pred = None
+        for p in reversed(self.pred_log):
+            if p.get("game_id") == game_id:
+                last_pred = p
+                break
+        if last_pred:
+            last_pred["crash_actual"] = crash
+            for coef_name in ["safe", "med", "risk", "recommended"]:
+                last_val = last_pred.get(coef_name)
+                if last_val:
+                    error = abs(last_val - crash) / max(1.0, crash)
+                    prev = self.last_metrics.get(f"avg_error_{coef_name}", 0.0)
+                    count = self.last_metrics.get(f"count_error_{coef_name}", 0)
+                    new_avg = (prev * count + error) / (count + 1)
+                    self.last_metrics[f"avg_error_{coef_name}"] = new_avg
+                    self.last_metrics[f"count_error_{coef_name}"] = count + 1
 
-            if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
-                try:
-                    self._online_train()
-                except Exception as e:
-                    logger.exception("process_feedback: _online_train failed: %s", e)
-        except Exception as e:
-            logger.exception("process_feedback failed: %s", e)
-            raise
+        if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
+            self._online_train()
 
     # -------------------------
-    # Остальные функции оставлены без изменений
-    # (get_pred_log, get_status, _online_train, mark/unmark_user_as_bot)
+    # Online training
+    # -------------------------
+    def _online_train(self):
+        if not self.training_buffer:
+            return
+        df = pd.DataFrame([{"target": s["target"], **s["features"]} for s in self.training_buffer])
+        X = df.drop(columns=["target"])
+        y = df["target"]
+        if len(y) >= 5:  # минимум 5 примеров
+            self.model_med.fit(X, y)
+            self.last_trained_at = time.time()
+            logger.info("Online training completed on %d samples", len(y))
+        self.training_buffer.clear()
+
+    # -------------------------
+    # Status & bot management
+    # -------------------------
+    def get_pred_log(self, limit: int = 20):
+        return list(self.pred_log)[-limit:]
+
+    def get_status(self):
+        return {
+            "total_games": self.total_processed_games,
+            "pred_log_len": len(self.pred_log),
+            "last_trained_at": self.last_trained_at,
+            "bot_count": len(self.bot_set)
+        }
+
+    def mark_user_as_bot(self, user_id: int):
+        self.bot_set.add(user_id)
+
+    def unmark_user_as_bot(self, user_id: int):
+        self.bot_set.discard(user_id)
