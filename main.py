@@ -40,7 +40,9 @@ bots_mgr = BotsManager()
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
     game_id: int
-    bets: list
+    deposit_sum: float
+    num_players: int
+    bets: list  # список ставок, каждая ставка: user_id, nickname, amount, coefficient_auto, time_fixed
 
 
 class FeedbackPayload(BaseModel):
@@ -51,29 +53,17 @@ class FeedbackPayload(BaseModel):
 
 # -------------------- Backup helpers --------------------
 async def save_backup():
-    """
-    Сохраняем snapshot состояния помощника (ассоциация state -> файл).
-    Чтобы уменьшить размер — рекомендуем сохранять только минимальное состояние:
-    - модели (можно сериализовать в отдельные файлы)
-    - индекс уже обработанных game_id'ов (games_index)
-    - предсказания (pred_log) — ограниченный по длине
-    - bots metadata (мы их сохраняем отдельно через BotsManager)
-    """
     try:
         logger.info("Saving backup...")
         snapshot = {
             "games_index": list(getattr(assistant, "games_index", [])),
-            # pred_log может быть deque — привести к list
             "pred_log": list(getattr(assistant, "pred_log", [])[-PRED_LOG_LEN:]),
-            # иные небольшие состояния, если есть (например модели можно сохранять отдельно)
             "meta": {
                 "saved_at": asyncio.get_event_loop().time()
             }
         }
-        # write locally
         with open(BACKUP_NAME, "w", encoding="utf-8") as f:
             json.dump(snapshot, f)
-        # upload
         await yandex_upload(BACKUP_NAME, BACKUP_FOLDER.rstrip("/") + "/" + BACKUP_NAME)
         logger.info("Backup uploaded successfully")
     except Exception as e:
@@ -81,9 +71,6 @@ async def save_backup():
 
 
 async def restore_backup():
-    """
-    Скачиваем backup если есть и загружаем в assistant
-    """
     try:
         logger.info("Restoring backup if exists...")
         remote = await yandex_find(BACKUP_NAME)
@@ -94,7 +81,6 @@ async def restore_backup():
         await yandex_download_to_file(remote, local)
         with open(local, "r", encoding="utf-8") as f:
             state = json.load(f)
-        # ожидаем, что у assistant есть метод load_state или аналог
         if hasattr(assistant, "load_state"):
             assistant.load_state(state)
             logger.info("Assistant state restored from backup")
@@ -115,17 +101,11 @@ async def save_backup_loop():
 
 # -------------------- History loader --------------------
 async def process_history_file(remote_path: str, filename: str, block_records: int = BLOCK_RECORDS):
-    """
-    Скачиваем remote_path локально и парсим JSON массив поточно через ijson (в threadpool),
-    обрабатываем батчами.
-    """
     logger.info("Processing history file: %s (remote: %s)", filename, remote_path)
     local_path = filename
     try:
-        # скачиваем локально потоково
         await yandex_download_to_file(remote_path, local_path)
 
-        # парсинг ijson.items в отдельном потоке (чтобы не блокировать event loop)
         def iter_items(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 for item in ijson.items(f, "item"):
@@ -133,7 +113,7 @@ async def process_history_file(remote_path: str, filename: str, block_records: i
 
         batch = []
         async for item in async_iter_from_thread(iter_items, local_path):
-            # преобразуем bets поле если это строка
+            # bets уже массив, преобразуем при необходимости
             if isinstance(item, dict) and "bets" in item and isinstance(item["bets"], str):
                 try:
                     item["bets"] = json.loads(item["bets"])
@@ -141,22 +121,14 @@ async def process_history_file(remote_path: str, filename: str, block_records: i
                     item["bets"] = []
             batch.append(item)
             if len(batch) >= block_records:
-                # отправляем в assistant
                 if hasattr(assistant, "load_history_from_list"):
                     assistant.load_history_from_list(batch)
-                else:
-                    logger.warning("assistant has no load_history_from_list")
-                logger.info("Loaded block of %d records from %s", len(batch), filename)
                 batch.clear()
 
-        # остаток
         if batch:
             if hasattr(assistant, "load_history_from_list"):
                 assistant.load_history_from_list(batch)
-            logger.info("Loaded final block of %d records from %s", len(batch), filename)
 
-        # отметка: можно загружать флаг на диск (bots_mgr будет это делать)
-        # удаляем локальный файл
         try:
             os.remove(local_path)
         except Exception:
@@ -168,10 +140,6 @@ async def process_history_file(remote_path: str, filename: str, block_records: i
 
 
 async def async_iter_from_thread(generator_fn, *args, **kwargs):
-    """
-    Обёртка: запускает generator_fn в threadpool и возвращает async-генератор.
-    generator_fn должен возвращать итератор (yield) синхронно.
-    """
     loop = asyncio.get_event_loop()
     q = asyncio.Queue()
 
@@ -184,7 +152,6 @@ async def async_iter_from_thread(generator_fn, *args, **kwargs):
         finally:
             loop.call_soon_threadsafe(q.put_nowait, None)
 
-    # запускаем в threadpool
     await loop.run_in_executor(None, run)
 
     while True:
@@ -197,9 +164,7 @@ async def async_iter_from_thread(generator_fn, *args, **kwargs):
 
 
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=BLOCK_RECORDS):
-    # загрузка списка history files, пропуск тех, что уже помечены/обработаны
     for filename in files:
-        # check remote presence
         remote = await yandex_find(filename)
         if not remote:
             logger.warning("History file %s not found on Yandex", filename)
@@ -210,23 +175,14 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=BLOCK_RECO
 # -------------------- Startup / Endpoints --------------------
 @app.on_event("startup")
 async def startup_event():
-    # стартуем yandex worker
     global yandex_worker_task
     if yandex_worker_task is None:
         from utils import yandex_worker as _yworker
         yandex_worker_task = asyncio.create_task(_yworker())
 
-    # загружаем bots data
     await bots_mgr.load_from_disk()
-
-    # восстанавливаем backup
     await restore_backup()
-
-    # грузим history (первичная загрузка)
-    # делаем в background task, чтобы стартап не заблокировался слишком долго
     asyncio.create_task(load_history_files())
-
-    # периодические задачи
     asyncio.create_task(save_backup_loop())
     logger.info("Startup complete")
 
@@ -235,10 +191,8 @@ async def startup_event():
 async def predict(payload: BetsPayload):
     try:
         if hasattr(assistant, "predict_and_log"):
-            assistant.predict_and_log(payload.model_dump())
+            assistant.predict_and_log(payload.dict())
             last_pred = assistant.pred_log[-1] if getattr(assistant, "pred_log", None) else None
-            # publish to ably if configured (user code had ably usage)
-            # user handles Ably in their code — мы не публикуем здесь напрямую
             return {"status": "ok", "prediction": last_pred}
         else:
             raise RuntimeError("assistant has no predict_and_log")
@@ -267,7 +221,6 @@ async def logs(limit: int = 20):
         if callable(get_pred_log):
             return {"logs": get_pred_log(limit)}
         else:
-            # fallback: if assistant.pred_log exists
             pl = list(getattr(assistant, "pred_log", []))
             return {"logs": pl[-limit:]}
     except Exception as e:
@@ -282,7 +235,6 @@ async def status():
         if callable(get_status):
             st = get_status()
         else:
-            # minimal fallback
             st = {
                 "total_games": len(getattr(assistant, "games_index", [])),
                 "pred_log_len": len(getattr(assistant, "pred_log", []))
@@ -323,14 +275,9 @@ async def unmark_bot_endpoint(user_id: str):
 
 @app.get("/metrics")
 async def metrics_sample(limit: int = 100):
-    """
-    Пример endpoint'а, который собирает последние limit предсказаний из assistant.pred_log
-    и возвращает базовые метрики (avg_error, hit rates).
-    """
     try:
         pl = list(getattr(assistant, "pred_log", []))
         data = pl[-limit:]
-        # ожидаем, что каждый pred в log содержит pred_safe/pred_med/pred_risk и actual
         metrics = evaluate_predictions_batch(data)
         return {"metrics": metrics}
     except Exception as e:
