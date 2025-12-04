@@ -11,36 +11,14 @@ import pandas as pd
 from lightgbm import LGBMRegressor
 import ably
 
+from utils import crash_to_color  # единая функция для всех файлов
+
 logger = logging.getLogger("ai_assistant.model")
 logger.setLevel(logging.INFO)
 
 
 def clamp(v, a, b):
     return max(a, min(b, v))
-
-
-def crash_to_color(crash: float) -> str:
-    """
-    Преобразует значение краша в цветовой bucket:
-    1.00 - 1.19: red
-    1.20 - 1.99: blue
-    2.00 - 3.99: pink
-    4.00 - 7.99: green
-    8.00 - 24.99: yellow
-    25+: gradient
-    """
-    if crash < 1.2:
-        return "red"
-    elif crash < 2.0:
-        return "blue"
-    elif crash < 4.0:
-        return "pink"
-    elif crash < 8.0:
-        return "green"
-    elif crash < 25.0:
-        return "yellow"
-    else:
-        return "gradient"
 
 
 class AIAssistant:
@@ -97,6 +75,9 @@ class AIAssistant:
     # State backup/restore
     # -------------------------
     def export_state(self) -> Dict[str, Any]:
+        """
+        Снимок текущего состояния помощника (для будущего внешнего бэкапа)
+        """
         return {
             "pred_log": list(self.pred_log),
             "training_buffer": list(self.training_buffer),
@@ -110,6 +91,9 @@ class AIAssistant:
         }
 
     def load_state(self, state: Dict[str, Any]):
+        """
+        Восстановление состояния помощника из снимка
+        """
         try:
             self.pred_log = deque(state.get("pred_log", []), maxlen=self.pred_log_len)
             self.training_buffer = deque(state.get("training_buffer", []), maxlen=self.training_buffer.maxlen)
@@ -201,7 +185,7 @@ class AIAssistant:
     # Color sequence & pattern search
     # -------------------------
     def add_color_to_sequence(self, crash_value: float):
-        color_bucket = crash_to_color(crash_value)
+        color_bucket = crash_to_color(crash_value)  # теперь единая функция из utils
         self.color_sequence.append(color_bucket)
 
     def find_color_pattern(self, pattern: list[str]) -> int:
@@ -213,7 +197,7 @@ class AIAssistant:
                 count += 1
         return count
 
-    # -------------------------
+      # -------------------------
     # Prediction
     # -------------------------
     def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -375,3 +359,13 @@ class AIAssistant:
                     successes += 1
                 total += 1
         return round((successes / total) * 100, 1) if total else 0.0
+
+    # -------------------------
+    # Заглушка для будущего BackupManager
+    # -------------------------
+    def save_full_backup(self):
+        """
+        Здесь будет вызываться функция из BackupManager для полного бэкапа системы.
+        Пока заглушка.
+        """
+        logger.info("save_full_backup called - placeholder for future BackupManager integration")
