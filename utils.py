@@ -23,10 +23,6 @@ yandex_worker_task: asyncio.Task | None = None
 
 
 async def run_yandex_task(func, *args, **kwargs):
-    """
-    Помещаем синхронную функцию yadisk в очередь worker'а для последовательного выполнения.
-    Возвращает результат или бросает исключение.
-    """
     loop = asyncio.get_event_loop()
     fut = loop.create_future()
     await yandex_queue.put((func, args, kwargs, fut))
@@ -38,7 +34,6 @@ async def yandex_worker():
     while True:
         func, args, kwargs, fut = await yandex_queue.get()
         try:
-            # выполняем синхронную функцию в threadpool, чтобы не блокировать event loop
             result = await asyncio.get_event_loop().run_in_executor(None, lambda: func(*args, **kwargs))
             if not fut.done():
                 fut.set_result(result)
@@ -56,16 +51,10 @@ async def yandex_ls(path: str = "/"):
 
 
 async def yandex_find(filename: str, path: str = "/"):
-    """
-    Ищет файл в указанной папке (по name). Возвращает путь '/filename' или None.
-    NOTE: простая реализация: листинг корня. При необходимости расширить до рекурсивного поиска.
-    """
     try:
         items = await yandex_ls(path)
         for item in items:
-            # item — объект yadisk.YaDiskFile (имеет attribute name и path)
             if getattr(item, "name", None) == filename or getattr(item, "path", "").endswith("/" + filename):
-                # вернуть полный путь
                 return getattr(item, "path", "/" + filename)
         return None
     except Exception as e:
@@ -86,21 +75,13 @@ async def yandex_move(src: str, dst: str, overwrite: bool = True):
 
 
 async def yandex_get_download_link(remote_path: str) -> str:
-    """
-    Возвращает прямую ссылку на файл (yadisk.get_download_link)
-    """
     return await run_yandex_task(yadisk_client.get_download_link, remote_path)
 
 
 async def yandex_download_stream(remote_path: str, chunk_size: int = DOWNLOAD_CHUNK) -> AsyncGenerator[bytes, None]:
-    """
-    Асинхронный генератор блоков данных из файла на Яндекс.Диске.
-    Возвращает raw bytes.
-    """
     download_url = await yandex_get_download_link(remote_path)
     if not download_url:
         raise FileNotFoundError(f"Can't obtain download link for {remote_path}")
-
     async with aiohttp.ClientSession() as session:
         async with session.get(download_url) as resp:
             resp.raise_for_status()
@@ -109,9 +90,6 @@ async def yandex_download_stream(remote_path: str, chunk_size: int = DOWNLOAD_CH
 
 
 async def yandex_download_to_file(remote_path: str, local_path: str, chunk_size: int = DOWNLOAD_CHUNK):
-    """
-    Скачиваем удалённый файл в локальный файл потоково.
-    """
     async with aiofiles.open(local_path, "wb") as f:
         async for block in yandex_download_stream(remote_path, chunk_size=chunk_size):
             await f.write(block)
@@ -121,3 +99,69 @@ async def yandex_download_to_file(remote_path: str, local_path: str, chunk_size:
 # Небольшие помощники
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
+
+
+# -------------------------
+# Дополнительные функции для AI Helper
+# -------------------------
+def calculate_net_win(amount: float, coefficient: float | None) -> float:
+    """
+    Рассчитывает чистый выигрыш игрока:
+      - если coefficient = None -> проиграл -> 0
+      - иначе -> (coefficient - 1) * amount
+    """
+    if coefficient is None:
+        return 0.0
+    return max(0.0, (float(coefficient) - 1.0) * float(amount))
+
+
+def crash_to_color(crash: float) -> str:
+    """
+    Определяет цвет по значению краша:
+    1.00 - 1.19: красный
+    1.20 - 1.99: синий
+    2.00 - 3.99: розовый
+    4.00 - 7.99: зеленый
+    8.00 - 24.99: желтый
+    25+: градиент (возвращаем 'gradient')
+    """
+    if crash < 1.2:
+        return "red"
+    elif crash < 2.0:
+        return "blue"
+    elif crash < 4.0:
+        return "pink"
+    elif crash < 8.0:
+        return "green"
+    elif crash < 25.0:
+        return "yellow"
+    else:
+        return "gradient"
+
+
+def parse_bets_input(game: dict) -> list[dict]:
+    """
+    Преобразует raw input из парсера в список ставок с нужными ключами:
+    {
+      "user_id": int,
+      "nickname": str,
+      "amount": float,
+      "coefficient_auto": float
+    }
+    """
+    bets = game.get("bets", [])
+    if isinstance(bets, str):
+        import json
+        try:
+            bets = json.loads(bets)
+        except Exception:
+            bets = []
+    return [
+        {
+            "user_id": b.get("user_id"),
+            "nickname": b.get("nickname"),
+            "amount": float(b.get("amount", 0.0) or 0.0),
+            "coefficient_auto": float(b.get("coefficient_auto", 0.0) or 0.0)
+        }
+        for b in bets
+    ]
