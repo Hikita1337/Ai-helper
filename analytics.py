@@ -5,10 +5,15 @@
 
 from typing import List, Dict, Any
 import logging
+import time
 
 from utils import calculate_net_win, crash_to_color
+from backup_manager import BackupManager  # полноценный файл для бэкапа
+from config import BACKUP_FOLDER
 
 logger = logging.getLogger("ai_assistant.analytics")
+
+backup_manager = BackupManager()  # создаем объект для работы с бэкапом
 
 
 def compute_avg_relative_error(preds: List[float], actuals: List[float]) -> float:
@@ -86,6 +91,34 @@ def compute_net_wins(user_results: List[Dict[str, Any]]) -> Dict[int, float]:
 
 def annotate_crash_colors(crash: float) -> str:
     """
-    Преобразует crash в цвет, используя единую функцию из utils
+    Преобразует crash в цвет через утилиту crash_to_color
     """
     return crash_to_color(crash)
+
+
+# -------------------------
+# Интеграция с BackupManager
+# -------------------------
+def save_analytics_state(state: Dict[str, Any]):
+    """
+    Сохраняет текущее состояние аналитики через BackupManager
+    """
+    try:
+        backup_manager.save_state("analytics", state)
+        logger.info("Analytics state saved via BackupManager")
+    except Exception as e:
+        logger.exception("Failed to save analytics state via BackupManager: %s", e)
+
+
+def load_analytics_state() -> Dict[str, Any]:
+    """
+    Загружает состояние аналитики через BackupManager
+    """
+    try:
+        state = backup_manager.load_state("analytics")
+        if state is None:
+            return {}
+        return state
+    except Exception as e:
+        logger.exception("Failed to load analytics state via BackupManager: %s", e)
+        return {}
