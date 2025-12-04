@@ -35,12 +35,13 @@ logger = logging.getLogger("ai_assistant.main")
 
 app = FastAPI(title="Crash AI Assistant")
 
-assistant = AIAssistant()
-bots_mgr = BotsManager()
-
-# Ably client
+# -------------------- Ably setup --------------------
 ably_client = ably.RestClient(ABLY_API_KEY)
-ably_channel = ably_client.channels.get("predictions")
+ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реального времени
+
+# -------------------- Core objects --------------------
+assistant = AIAssistant(ably_channel=ably_channel)  # передаем канал внутрь ассистента
+bots_mgr = BotsManager()
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
@@ -49,12 +50,10 @@ class BetsPayload(BaseModel):
     num_players: int
     bets: list  # список ставок, каждая ставка: user_id, nickname, amount, coefficient_auto, time_fixed
 
-
 class FeedbackPayload(BaseModel):
     game_id: int
     crash: float
     bets: list | None = None
-
 
 # -------------------- Backup helpers --------------------
 async def save_backup():
@@ -73,7 +72,6 @@ async def save_backup():
         logger.info("Backup uploaded successfully")
     except Exception as e:
         logger.exception("save_backup failed: %s", e)
-
 
 async def restore_backup():
     try:
@@ -94,7 +92,6 @@ async def restore_backup():
     except Exception as e:
         logger.exception("restore_backup failed: %s", e)
 
-
 async def save_backup_loop():
     while True:
         try:
@@ -102,7 +99,6 @@ async def save_backup_loop():
         except Exception as e:
             logger.exception("save_backup_loop error: %s", e)
         await asyncio.sleep(BACKUP_PERIOD_SECONDS)
-
 
 # -------------------- History loader --------------------
 async def process_history_file(remote_path: str, filename: str, block_records: int = BLOCK_RECORDS):
@@ -142,7 +138,6 @@ async def process_history_file(remote_path: str, filename: str, block_records: i
     except Exception as e:
         logger.exception("Error processing history file %s: %s", filename, e)
 
-
 async def async_iter_from_thread(generator_fn, *args, **kwargs):
     loop = asyncio.get_event_loop()
     q = asyncio.Queue()
@@ -166,7 +161,6 @@ async def async_iter_from_thread(generator_fn, *args, **kwargs):
             raise item
         yield item
 
-
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=BLOCK_RECORDS):
     for filename in files:
         remote = await yandex_find(filename)
@@ -175,8 +169,7 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=BLOCK_RECO
             continue
         await process_history_file(remote, filename, block_records=block_records)
 
-
-# -------------------- Startup / Endpoints --------------------
+# -------------------- Startup --------------------
 @app.on_event("startup")
 async def startup_event():
     global yandex_worker_task
@@ -190,25 +183,7 @@ async def startup_event():
     asyncio.create_task(save_backup_loop())
     logger.info("Startup complete")
 
-
-@app.post("/predict")
-async def predict(payload: BetsPayload):
-    try:
-        if hasattr(assistant, "predict_and_log"):
-            pred = assistant.predict_and_log(payload.dict())
-            # отправка в Ably
-            try:
-                ably_channel.publish("new_prediction", pred)
-            except Exception as e:
-                logger.exception("Ably publish failed: %s", e)
-            return {"status": "ok", "prediction": pred}
-        else:
-            raise RuntimeError("assistant has no predict_and_log")
-    except Exception as e:
-        logger.exception("predict failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
+# -------------------- Feedback endpoint --------------------
 @app.post("/feedback")
 async def feedback(payload: FeedbackPayload):
     try:
@@ -221,7 +196,7 @@ async def feedback(payload: FeedbackPayload):
         logger.exception("feedback failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
+# -------------------- Monitoring endpoints --------------------
 @app.get("/logs")
 async def logs(limit: int = 20):
     try:
@@ -234,7 +209,6 @@ async def logs(limit: int = 20):
     except Exception as e:
         logger.exception("logs error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/status")
 async def status():
@@ -253,11 +227,9 @@ async def status():
         logger.exception("status error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.get("/bots")
 async def bots_list():
     return bots_mgr.summary()
-
 
 @app.post("/bots/mark/{user_id}")
 async def mark_bot_endpoint(user_id: str, info: dict | None = None):
@@ -269,7 +241,6 @@ async def mark_bot_endpoint(user_id: str, info: dict | None = None):
         logger.exception("mark_bot failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/bots/unmark/{user_id}")
 async def unmark_bot_endpoint(user_id: str):
     try:
@@ -279,7 +250,6 @@ async def unmark_bot_endpoint(user_id: str):
     except Exception as e:
         logger.exception("unmark_bot failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/metrics")
 async def metrics_sample(limit: int = 100):
