@@ -5,7 +5,7 @@ import json
 import logging
 from collections import deque, defaultdict
 from typing import List, Dict, Any
-
+import asyncio
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
@@ -361,11 +361,27 @@ class AIAssistant:
         return round((successes / total) * 100, 1) if total else 0.0
 
     # -------------------------
-    # Заглушка для будущего BackupManager
+    # Backup integration
     # -------------------------
+    def attach_backup_manager(self, backup_manager):
+        """
+        Назначает внешний BackupManager для модели.
+        Вызывается из main при инициализации всех модулей.
+        """
+        self.backup_manager = backup_manager
+
     def save_full_backup(self):
         """
-        Здесь будет вызываться функция из BackupManager для полного бэкапа системы.
-        Пока заглушка.
+        Реальный вызов BackupManager.
+        Запускает асинхронное сохранение состояния без блокировки основного процесса.
         """
-        logger.info("save_full_backup called - placeholder for future BackupManager integration")
+        if not hasattr(self, "backup_manager") or self.backup_manager is None:
+            logger.warning("BackupManager not attached — backup skipped")
+            return
+
+        try:
+            # Асинхронно ставим задачу в очередь BackupManager
+            asyncio.create_task(self.backup_manager.queue_backup())
+            logger.info("Backup queued for saving")
+        except Exception as e:
+            logger.exception("Failed to queue backup: %s", e)
