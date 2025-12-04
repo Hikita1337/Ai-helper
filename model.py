@@ -4,7 +4,7 @@ import math
 import json
 import joblib
 import logging
-from collections import deque, Counter, defaultdict
+from collections import deque, defaultdict
 from typing import List, Dict, Any
 
 import numpy as np
@@ -72,7 +72,8 @@ class AIAssistant:
             "last_active": 0,
             "wins": 0,
             "losses": 0,
-            "total_win": 0.0
+            "total_win": 0.0,
+            "nickname": ""
         })
 
         # Набор выявленных ботов (user_id)
@@ -105,7 +106,7 @@ class AIAssistant:
             "pred_log": list(self.pred_log),
             "last_metrics": self.last_metrics,
             "total_processed_games": int(self.total_processed_games),
-            "bot_list": list(sorted(list(self.bot_set)))[:5000],
+            "bot_list": {uid: self.user_stats.get(uid, {}).get("nickname", "") for uid in self.bot_set},
             "user_summary_count": len(self.user_stats),
             "color_tail": list(self.color_sequence)[-1000:],
             "timestamp": time.time()
@@ -118,8 +119,10 @@ class AIAssistant:
             self.pred_log = deque(pred_log, maxlen=self.pred_log_len)
             self.last_metrics = state.get("last_metrics", {})
             self.total_processed_games = int(state.get("total_processed_games", 0))
-            bot_list = state.get("bot_list", [])
-            self.bot_set = set(bot_list)
+            bot_list = state.get("bot_list", {})
+            self.bot_set = set(bot_list.keys())
+            for uid, nick in bot_list.items():
+                self.user_stats[uid]["nickname"] = nick
             color_tail = state.get("color_tail", [])
             self.color_sequence = deque(color_tail, maxlen=self.color_seq_len)
             logger.info("State loaded into assistant")
@@ -129,7 +132,7 @@ class AIAssistant:
     # -------------------------
     # Utilities: features / scoring
     # -------------------------
-    def _record_user_bet(self, user_id: int, amount: float, auto: float, taken_coef: float | None, ts: float):
+    def _record_user_bet(self, user_id: int, amount: float, auto: float, taken_coef: float | None, ts: float, nickname: str | None = None):
         st = self.user_stats[user_id]
         st["count"] += 1
         st["total_amount"] += float(amount or 0.0)
@@ -141,6 +144,8 @@ class AIAssistant:
             st["total_win"] += max(0.0, (float(taken_coef) - 1.0) * float(amount))
         else:
             st["losses"] += 1
+        if nickname:
+            st["nickname"] = nickname
 
     def _features_from_game(self, game: Dict[str, Any]) -> Dict[str, float]:
         num_players = float(game.get("num_players", 0)) or 0.0
@@ -172,6 +177,21 @@ class AIAssistant:
             "bot_fraction": float(bot_fraction),
             "color_index": float(color_index)
         }
+
+    # -------------------------
+    # Success rate helper
+    # -------------------------
+    def _success_rate(self, coef_key: str) -> float:
+        successes = 0
+        total = 0
+        for p in self.pred_log:
+            pred = p.get(coef_key)
+            actual = p.get("crash_actual")
+            if pred is not None and actual is not None:
+                if pred <= actual:  # ставка успешна
+                    successes += 1
+                total += 1
+        return round((successes / total) * 100, 1) if total else 0.0
 
     # -------------------------
     # Loading history (batch)
@@ -210,10 +230,11 @@ class AIAssistant:
                     uid = b.get("user_id")
                     amt = float(b.get("amount", 0.0) or 0.0)
                     auto = float(b.get("auto", 0.0) or 0.0)
+                    nickname = b.get("nickname")
                     taken_coef = b.get("coefficient") if b.get("coefficient") not in (None, "", "null") else None
                     if taken_coef is None and auto and crash_val is not None and crash_val >= auto:
                         taken_coef = auto
-                    self._record_user_bet(uid, amt, auto, taken_coef, ts_now)
+                    self._record_user_bet(uid, amt, auto, taken_coef, ts_now, nickname=nickname)
 
                 if compact["crash"] is not None:
                     features = self._features_from_game({"bets": bets,
@@ -259,19 +280,30 @@ class AIAssistant:
 
             safe = clamp(med_pred * 0.88, 1.01, med_pred)
             risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
+            recommended = clamp(safe + (med_pred - safe) * 0.5, safe, risk)  # рекомендуемый
 
-            recommended_pct = clamp(0.05 / max(med_pred - 1.0, 0.01), 0.005, 0.2)
+            recommended_pct = clamp(0.05 / max(recommended - 1.0, 0.01), 0.005, 0.2)
 
             result = {
                 "game_id": game_id,
                 "safe": round(float(safe), 3),
                 "med": round(float(med_pred), 3),
                 "risk": round(float(risk), 3),
+                "recommended": round(float(recommended), 3),
                 "recommended_pct": float(round(recommended_pct, 4)),
                 "ts": time.time()
             }
 
+            # сохраняем предсказание
             self.pred_log.append(result)
+            # ограничение последних 75 игр
+            if len(self.pred_log) > 75:
+                self.pred_log.popleft()
+
+            # вычисление доли успешных предсказаний
+            for coef in ["safe", "med", "risk", "recommended"]:
+                result[f"success_rate_{coef}"] = self._success_rate(coef)
+
             return result
         except Exception as e:
             logger.exception("predict_and_log failed: %s", e)
@@ -288,10 +320,11 @@ class AIAssistant:
                     uid = b.get("user_id")
                     amt = float(b.get("amount", 0.0) or 0.0)
                     auto = float(b.get("auto", 0.0) or 0.0)
+                    nickname = b.get("nickname")
                     taken_coef = b.get("coefficient") if b.get("coefficient") not in (None, "", "null") else None
                     if taken_coef is None and auto and crash is not None and crash >= auto:
                         taken_coef = auto
-                    self._record_user_bet(uid, amt, auto, taken_coef, ts_now)
+                    self._record_user_bet(uid, amt, auto, taken_coef, ts_now, nickname=nickname)
 
             features = self._features_from_game({"bets": bets or [], "num_players": len(bets or []), "color_bucket": None})
             sample = {"features": features, "target": float(crash)}
@@ -303,12 +336,16 @@ class AIAssistant:
                     last_pred = p
                     break
             if last_pred:
-                error = abs(last_pred["med"] - crash) / max(1.0, crash)
-                prev = self.last_metrics.get("avg_error", 0.0)
-                count = self.last_metrics.get("count_error", 0)
-                new_avg = (prev * count + error) / (count + 1)
-                self.last_metrics["avg_error"] = new_avg
-                self.last_metrics["count_error"] = count + 1
+                last_pred["crash_actual"] = crash
+                for coef_name in ["safe", "med", "risk", "recommended"]:
+                    last_val = last_pred.get(coef_name)
+                    if last_val:
+                        error = abs(last_val - crash) / max(1.0, crash)
+                        prev = self.last_metrics.get(f"avg_error_{coef_name}", 0.0)
+                        count = self.last_metrics.get(f"count_error_{coef_name}", 0)
+                        new_avg = (prev * count + error) / (count + 1)
+                        self.last_metrics[f"avg_error_{coef_name}"] = new_avg
+                        self.last_metrics[f"count_error_{coef_name}"] = count + 1
 
             if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
                 try:
