@@ -239,70 +239,60 @@ class AIAssistant:
     # -------------------------
     # Prediction API
     # -------------------------
-    def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            game_id = payload.get("game_id")
-            bets = payload.get("bets", [])
-            if isinstance(bets, str):
-                try:
-                    bets = json.loads(bets)
-                except Exception:
-                    bets = []
-
-            features = self._features_from_game({"bets": bets,
-                                                "num_players": len(bets),
-                                                "color_bucket": None})
-            med_pred = None
+  def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        game_id = payload.get("game_id")
+        bets = payload.get("bets", [])
+        if isinstance(bets, str):
             try:
-                med_pred = float(self.model_med.predict(pd.DataFrame([features]))[0])
-                med_pred = max(1.0, med_pred)
+                bets = json.loads(bets)
             except Exception:
-                hist_crashes = [h["crash"] for h in list(self.history_deque) if h.get("crash")]
-                hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
-                med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
+                bets = []
 
-            safe = clamp(med_pred * 0.88, 1.01, med_pred)
-            risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
-            recommended = clamp(safe + (med_pred - safe) * 0.5, safe, risk)
+        features = self._features_from_game({"bets": bets,
+                                            "num_players": len(bets),
+                                            "color_bucket": None})
+        med_pred = None
+        try:
+            med_pred = float(self.model_med.predict(pd.DataFrame([features]))[0])
+            med_pred = max(1.0, med_pred)
+        except Exception:
+            hist_crashes = [h["crash"] for h in list(self.history_deque) if h.get("crash")]
+            hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
+            med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
 
-            recommended_pct = clamp(0.05 / max(recommended - 1.0, 0.01), 0.005, 0.2)
+        safe = clamp(med_pred * 0.88, 1.01, med_pred)
+        risk = clamp(med_pred * 1.20, med_pred, med_pred * 3)
+        recommended = clamp(safe + (med_pred - safe) * 0.5, safe, risk)
 
-            result = {
-                "game_id": game_id,
-                "safe": round(float(safe), 3),
-                "med": round(float(med_pred), 3),
-                "risk": round(float(risk), 3),
-                "recommended": round(float(recommended), 3),
-                "recommended_pct": float(round(recommended_pct, 4)),
-                "ts": time.time(),
-                "crash_actual": None
-            }
+        # доверительные проценты для всех коэффициентов
+        coef_values = {"safe": safe, "med": med_pred, "risk": risk, "recommended": recommended}
+        coef_pct = {k: clamp(0.05 / max(v - 1.0, 0.01), 0.005, 0.2) for k, v in coef_values.items()}
 
-            # сохраняем предсказание
-            self.pred_log.append(result)
-            if len(self.pred_log) > 75:
-                self.pred_log.popleft()
+        result = {"game_id": game_id, "ts": time.time(), "crash_actual": None}
+        for k in coef_values:
+            result[k] = round(float(coef_values[k]), 3)
+            result[f"{k}_pct"] = float(round(coef_pct[k], 4))
+            result[f"success_rate_{k}"] = self._success_rate(k)
+            avg_err = self.last_metrics.get(f"avg_error_{k}", None)
+            result[f"avg_error_{k}"] = round(avg_err, 4) if avg_err is not None else None
 
-            # обновление доли успешных предсказаний
-            for coef in ["safe", "med", "risk", "recommended"]:
-                result[f"success_rate_{coef}"] = self._success_rate(coef)
-                avg_err = self.last_metrics.get(f"avg_error_{coef}", None)
-                if avg_err is not None:
-                    result[f"avg_error_{coef}"] = round(avg_err, 4)
-                else:
-                    result[f"avg_error_{coef}"] = None
+        # сохраняем предсказание
+        self.pred_log.append(result)
+        if len(self.pred_log) > 75:
+            self.pred_log.popleft()
 
-            # публикация в Ably
-            if self.ably_channel:
-                try:
-                    self.ably_channel.publish("new_prediction", result)
-                except Exception as e:
-                    logger.exception("Ably publish failed: %s", e)
+        # публикация в Ably
+        if self.ably_channel:
+            try:
+                self.ably_channel.publish("new_prediction", result)
+            except Exception as e:
+                logger.exception("Ably publish failed: %s", e)
 
-            return result
-        except Exception as e:
-            logger.exception("predict_and_log failed: %s", e)
-            raise
+        return result
+    except Exception as e:
+        logger.exception("predict_and_log failed: %s", e)
+        raise
 
     # -------------------------
     # Feedback & online learning
