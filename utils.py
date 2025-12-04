@@ -116,15 +116,7 @@ def calculate_net_win(amount: float, coefficient: float | None) -> float:
 
 
 def crash_to_color(crash: float) -> str:
-    """
-    Определяет цвет по значению краша:
-    1.00 - 1.19: красный
-    1.20 - 1.99: синий
-    2.00 - 3.99: розовый
-    4.00 - 7.99: зеленый
-    8.00 - 24.99: желтый
-    25+: градиент (возвращаем 'gradient')
-    """
+    
     if crash < 1.2:
         return "red"
     elif crash < 2.0:
