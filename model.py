@@ -10,6 +10,7 @@ from typing import List, Dict, Any
 import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
+import ably
 
 logger = logging.getLogger("ai_assistant.model")
 logger.setLevel(logging.INFO)
@@ -41,7 +42,8 @@ class AIAssistant:
                  pending_threshold: int = 50,
                  retrain_min_minutes: int = 10,
                  max_history_records: int = 50000,
-                 max_training_buffer: int = 50000):
+                 max_training_buffer: int = 50000,
+                 ably_api_key: str | None = None):
         self.color_seq_len = color_seq_len
         self.pred_log_len = pred_log_len
         self.pending_threshold = pending_threshold
@@ -76,6 +78,10 @@ class AIAssistant:
 
         self.max_active_users_to_cache = 5000
         self.min_train_samples = 200
+
+        # Ably
+        self.ably_client = ably.RestClient(ably_api_key) if ably_api_key else None
+        self.ably_channel = self.ably_client.channels.get("predictions") if self.ably_client else None
 
         logger.info("AIAssistant initialized")
 
@@ -285,6 +291,13 @@ class AIAssistant:
                     result[f"avg_error_{coef}"] = round(avg_err, 4)
                 else:
                     result[f"avg_error_{coef}"] = None
+
+            # публикация в Ably
+            if self.ably_channel:
+                try:
+                    self.ably_channel.publish("new_prediction", result)
+                except Exception as e:
+                    logger.exception("Ably publish failed: %s", e)
 
             return result
         except Exception as e:
