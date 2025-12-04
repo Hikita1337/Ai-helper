@@ -13,6 +13,7 @@ import aiofiles
 import json
 from dotenv import load_dotenv
 import ijson
+import ably
 
 from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
@@ -36,6 +37,10 @@ app = FastAPI(title="Crash AI Assistant")
 
 assistant = AIAssistant()
 bots_mgr = BotsManager()
+
+# Ably client
+ably_client = ably.RestClient(ABLY_API_KEY)
+ably_channel = ably_client.channels.get("predictions")
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
@@ -113,7 +118,6 @@ async def process_history_file(remote_path: str, filename: str, block_records: i
 
         batch = []
         async for item in async_iter_from_thread(iter_items, local_path):
-            # bets уже массив, преобразуем при необходимости
             if isinstance(item, dict) and "bets" in item and isinstance(item["bets"], str):
                 try:
                     item["bets"] = json.loads(item["bets"])
@@ -191,9 +195,13 @@ async def startup_event():
 async def predict(payload: BetsPayload):
     try:
         if hasattr(assistant, "predict_and_log"):
-            assistant.predict_and_log(payload.dict())
-            last_pred = assistant.pred_log[-1] if getattr(assistant, "pred_log", None) else None
-            return {"status": "ok", "prediction": last_pred}
+            pred = assistant.predict_and_log(payload.dict())
+            # отправка в Ably
+            try:
+                ably_channel.publish("new_prediction", pred)
+            except Exception as e:
+                logger.exception("Ably publish failed: %s", e)
+            return {"status": "ok", "prediction": pred}
         else:
             raise RuntimeError("assistant has no predict_and_log")
     except Exception as e:
