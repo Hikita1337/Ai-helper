@@ -40,13 +40,15 @@ ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реально
 # -------------------- Core objects --------------------
 assistant = AIAssistant(ably_channel=ably_channel)
 bots_mgr = BotsManager()
-analytics_module = None  # заменить на реальный объект аналитики, если есть
+analytics_module = None  # если есть отдельный объект аналитики, передай сюда
 
+# -------------------- Backup Manager --------------------
 backup_mgr = BackupManager({
     "assistant": assistant,
     "bots": bots_mgr,
     "analytics": analytics_module
 })
+assistant.attach_backup_manager(backup_mgr)
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
@@ -137,9 +139,14 @@ async def startup_event():
         from utils import yandex_worker as _yworker
         yandex_worker_task = asyncio.create_task(_yworker())
 
+    # Загружаем состояние ботов
     await bots_mgr.load_from_disk()
+
+    # Запускаем воркер BackupManager и восстанавливаем состояние
     await backup_mgr.start_worker()
     await backup_mgr.restore_backup()
+
+    # Загружаем историю
     asyncio.create_task(load_history_files())
 
     logger.info("Startup complete")
