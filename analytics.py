@@ -5,6 +5,7 @@
 
 from typing import List, Dict, Any
 import logging
+import time
 from utils import calculate_net_win, crash_to_color
 
 logger = logging.getLogger("ai_assistant.analytics")
@@ -37,9 +38,7 @@ class Analytics:
                 errors.append(abs(p - a) / a)
             except Exception:
                 continue
-        if not errors:
-            return float("nan")
-        return sum(errors) / len(errors)
+        return sum(errors) / len(errors) if errors else float("nan")
 
     @staticmethod
     def compute_hit_rate(preds: List[float], actuals: List[float]) -> float:
@@ -76,8 +75,7 @@ class Analytics:
 
     def recommend_percent_from_risk(self, risk_score: float) -> float:
         base = 0.05
-        pct = max(0.005, base * (1.0 - risk_score))
-        return pct
+        return max(0.005, base * (1.0 - risk_score))
 
     # -------------------------
     # Новые функции для анализа ставок
@@ -101,18 +99,14 @@ class Analytics:
     # Полное сохранение/загрузка состояния
     # -------------------------
     def export_state(self) -> Dict[str, Any]:
-        """
-        Экспорт всего состояния аналитики для BackupManager.
-        """
+        """Экспорт всего состояния аналитики для BackupManager."""
         return {
             "analytics_state": self.analytics_state.copy(),
             "timestamp": time.time()
         }
 
     def load_state(self, state: Dict[str, Any]):
-        """
-        Восстановление состояния аналитики из бэкапа.
-        """
+        """Восстановление состояния аналитики из бэкапа."""
         try:
             self.analytics_state = state.get("analytics_state", {}).copy()
             logger.info("Analytics state loaded successfully")
