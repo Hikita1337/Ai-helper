@@ -12,6 +12,7 @@ BACKUP_NAME = "assistant_backup.json"
 BACKUP_FOLDER = "/"  # корень, можно сменить
 BOTS_FILE = "assistant_bots.json"         # хранит: bots + active_users метаданные
 CRASH_HISTORY_FILES = ["crash_23k.json"]  # список имен файлов для первичной загрузки
+FULL_BACKUP_FILE = os.path.join(BACKUP_FOLDER, "full_backup.json")
 
 # Параметры обработки
 BLOCK_RECORDS = 7000          # сколько записей обрабатывать за один "батч"
