@@ -1,24 +1,34 @@
 """
 Метрики/аналитика: функции оценки качества прогнозов, базовый расчёт recommended pct и
-рекомендованных коэффициентов.
+рекомендованных коэффициентов. Полное сохранение состояния через BackupManager.
 """
 
 from typing import List, Dict, Any
 import logging
-
 from utils import calculate_net_win, crash_to_color
+from backup_manager import BackupManager
 
 logger = logging.getLogger("ai_assistant.analytics")
 
 # -------------------------
-# Внутренние данные аналитики (в памяти)
+# Analytics RAM state
 # -------------------------
-pred_history: List[Dict[str, Any]] = []
-other_metrics: Dict[str, Any] = {}
+analytics_state = {
+    "pred_records": [],      # все записи прогнозов
+    "user_results": {},      # словарь user_id -> результат
+    "color_annotations": {}  # дополнительная аналитика по цветам
+}
+
+backup_manager = None  # объект BackupManager будет присоединён из main
+
+
+def attach_backup_manager(manager: BackupManager):
+    global backup_manager
+    backup_manager = manager
 
 
 # -------------------------
-# Функции расчёта ошибок и метрик
+# Метрики и расчет ошибок
 # -------------------------
 def compute_avg_relative_error(preds: List[float], actuals: List[float]) -> float:
     errors = []
@@ -80,46 +90,45 @@ def recommend_percent_from_risk(risk_score: float) -> float:
 # Новые функции для анализа ставок
 # -------------------------
 def compute_net_wins(user_results: List[Dict[str, Any]]) -> Dict[int, float]:
-    """
-    Возвращает словарь user_id -> чистый выигрыш
-    Если coefficient=None, игрок проиграл
-    """
     net_wins = {}
     for u in user_results:
         uid = u.get("user_id")
         coef = u.get("coefficient")
         amt = u.get("amount", 0.0)
         net_wins[uid] = calculate_net_win(amt, coef)
+    analytics_state["user_results"] = net_wins
     return net_wins
 
 
 def annotate_crash_colors(crash: float) -> str:
-    """
-    Преобразует crash в цвет через утилиту crash_to_color
-    """
-    return crash_to_color(crash)
+    color = crash_to_color(crash)
+    analytics_state["color_annotations"][crash] = color
+    return color
 
 
 # -------------------------
-# Интерфейс для BackupManager
+# Полное сохранение/загрузка состояния аналитики
 # -------------------------
-def export_state() -> dict:
-    """
-    Экспортирует внутреннее состояние аналитики для резервного копирования
-    """
-    return {
-        "pred_history": pred_history,
-        "other_metrics": other_metrics
-    }
-
-
-def load_state(state: dict):
-    """
-    Загружает состояние аналитики из бэкапа
-    """
+def save_analytics_state():
+    if backup_manager is None:
+        logger.warning("BackupManager not attached — analytics state not saved")
+        return
     try:
-        global pred_history, other_metrics
-        pred_history = state.get("pred_history", [])
-        other_metrics = state.get("other_metrics", {})
+        backup_manager.save_state("analytics", analytics_state)
+        logger.info("Analytics state saved via BackupManager")
     except Exception as e:
-        logger.exception("Failed to load analytics state: %s", e)
+        logger.exception("Failed to save analytics state via BackupManager: %s", e)
+
+
+def load_analytics_state():
+    if backup_manager is None:
+        logger.warning("BackupManager not attached — analytics state not loaded")
+        return
+    try:
+        state = backup_manager.load_state("analytics")
+        if state:
+            global analytics_state
+            analytics_state = state
+            logger.info("Analytics state loaded via BackupManager")
+    except Exception as e:
+        logger.exception("Failed to load analytics state via BackupManager: %s", e)
