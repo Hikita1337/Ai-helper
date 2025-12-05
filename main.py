@@ -53,6 +53,28 @@ class FeedbackPayload(BaseModel):
     crash: float
     bets: list | None = None
 
+# -------------------- Flag для обработки истории --------------------
+FLAG_FILE = "history_processed_flag.json"
+
+async def is_history_processed() -> bool:
+    """Проверяет наличие флага, что история уже обработана."""
+    if os.path.exists(FLAG_FILE):
+        try:
+            with open(FLAG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("processed", False)
+        except Exception:
+            return False
+    return False
+
+async def set_history_processed_flag():
+    """Создаёт флаг о том, что история обработана."""
+    try:
+        with open(FLAG_FILE, "w", encoding="utf-8") as f:
+            json.dump({"processed": True, "timestamp": time.time()}, f)
+    except Exception as e:
+        logger.exception("Failed to set history processed flag: %s", e)
+
 # -------------------- History loader --------------------
 async def process_history_file(remote_path: str, filename: str, block_records: int = BLOCK_RECORDS):
     logger.info("Processing history file: %s (remote: %s)", filename, remote_path)
@@ -107,6 +129,9 @@ async def process_history_file(remote_path: str, filename: str, block_records: i
         if getattr(assistant, "ready_for_backup", True):
             await assistant.save_full_backup()
             logger.info("Primary backup saved after processing %s", filename)
+
+        # Ставим флаг, что история обработана
+        await set_history_processed_flag()
     except Exception as e:
         logger.exception("Error processing history file %s: %s", filename, e)
 
@@ -165,8 +190,12 @@ async def startup_event():
     await backup_mgr.start_worker()
     await backup_mgr.restore_backup()  # восстановление полного состояния
 
-    # Загрузка истории файлов блоками
-    asyncio.create_task(load_history_files())
+    # Проверяем, нужно ли обрабатывать историю
+    if not await is_history_processed():
+        logger.info("History not yet processed. Starting processing...")
+        asyncio.create_task(load_history_files())
+    else:
+        logger.info("History already processed. Skipping file processing.")
 
     # Запуск периодического бэкапа
     asyncio.create_task(periodic_backup_worker(BACKUP_INTERVAL_SECONDS))
