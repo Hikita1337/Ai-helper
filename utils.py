@@ -8,6 +8,7 @@ import aiohttp
 import aiofiles
 import os
 import json
+import codecs
 from typing import AsyncGenerator, Any
 import yadisk
 
@@ -81,36 +82,18 @@ async def yandex_get_download_link(remote_path: str) -> str:
     return await run_yandex_task(yadisk_client.get_download_link, remote_path)
 
 
-# --- Потоковое скачивание JSON чанками ---
-async def yandex_download_stream(remote_path: str, chunk_size: int = DOWNLOAD_CHUNK) -> AsyncGenerator[bytes, None]:
-    """Возвращает поток байтов из файла на Яндекс.Диске"""
-    download_url = await yandex_get_download_link(remote_path)
-    if not download_url:
-        raise FileNotFoundError(f"Не удалось получить ссылку для {remote_path}")
-    async with aiohttp.ClientSession() as session:
-        async with session.get(download_url) as resp:
-            resp.raise_for_status()
-            async for chunk in resp.content.iter_chunked(chunk_size):
-                yield chunk
-
-
-async def yandex_download_to_file(remote_path: str, local_path: str, chunk_size: int = DOWNLOAD_CHUNK):
-    """Скачивает файл целиком на диск"""
-    async with aiofiles.open(local_path, "wb") as f:
-        async for block in yandex_download_stream(remote_path, chunk_size=chunk_size):
-            await f.write(block)
-    logger.info("Файл %s скачан на диск", local_path)
-    return local_path
-
-
+# --- Потоковое скачивание JSON чанками с корректным UTF-8 ---
 async def yandex_download_stream_json(remote_path: str, chunk_size: int = DOWNLOAD_CHUNK) -> AsyncGenerator[Any, None]:
     """
     Скачивает JSON файл потоково и возвращает полноценные элементы JSON,
-    корректно собирая элементы, которые могут быть разделены между чанками.
+    корректно собирая элементы, которые могут быть разделены между чанками,
+    с безопасным декодированием UTF-8.
     """
     buffer = ""
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    
     async for chunk in yandex_download_stream(remote_path, chunk_size=chunk_size):
-        text = chunk.decode("utf-8")
+        text = decoder.decode(chunk)
         buffer += text
         while True:
             try:
@@ -119,6 +102,10 @@ async def yandex_download_stream_json(remote_path: str, chunk_size: int = DOWNLO
                 buffer = buffer[idx:].lstrip(", \n")
             except json.JSONDecodeError:
                 break
+
+    # Завершаем декодер, чтобы собрать остаток
+    text = decoder.decode(b"", final=True)
+    buffer += text
     if buffer.strip():
         try:
             obj = json.loads(buffer)
