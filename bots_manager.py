@@ -12,7 +12,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any
 from config import BOTS_FILE, BACKUP_FOLDER, MAX_ACTIVE_USERS, MAX_BOTS_IN_MEMORY, BOT_INACTIVE_DAYS
-from utils import yandex_find, yandex_upload, calculate_net_win
+from utils import yandex_find, yandex_upload,yandex_download_to_file,calculate_net_win
 
 logger = logging.getLogger("ai_assistant.bots")
 
