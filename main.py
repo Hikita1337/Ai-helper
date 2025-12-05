@@ -6,7 +6,7 @@ import asyncio
 import json
 from dotenv import load_dotenv
 import ijson
-import ably
+from ably import AblyRealtime
 import time
 
 from config import (
@@ -26,8 +26,8 @@ logger = logging.getLogger("ai_assistant.main")
 app = FastAPI(title="Crash AI Assistant")
 
 # -------------------- Ably setup --------------------
-ably_client = ably.RestClient(ABLY_API_KEY)
-ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реального времени
+ably_client = AblyRealtime(ABLY_API_KEY)
+ably_channel = ably_client.channels.get("ABLU-TAI")
 
 # -------------------- Core objects --------------------
 assistant = AIAssistant(ably_channel=ably_channel)
