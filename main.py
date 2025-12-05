@@ -1,9 +1,3 @@
-"""
-Основной FastAPI приложение.
-Подключаем BotsManager, utils, analytics и BackupManager;
-обрабатываем старые файлы истории, потоково загружаем большие JSON и парсим их батчами.
-"""
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
@@ -13,10 +7,11 @@ import json
 from dotenv import load_dotenv
 import ijson
 import ably
+import time
 
 from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
-    CRASH_HISTORY_FILES, BLOCK_RECORDS, PRED_LOG_LEN
+    CRASH_HISTORY_FILES, BLOCK_RECORDS, PRED_LOG_LEN, BACKUP_INTERVAL_SECONDS
 )
 from utils import yandex_download_to_file, yandex_find, yandex_worker, yandex_worker_task
 from bots_manager import BotsManager
@@ -37,7 +32,7 @@ ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реально
 # -------------------- Core objects --------------------
 assistant = AIAssistant(ably_channel=ably_channel)
 bots_mgr = BotsManager()
-analytics_module = None  # если позже нужно, можно создать объект аналитики
+analytics_module = None  # можно создать объект аналитики, если нужно
 
 # -------------------- Backup Manager --------------------
 backup_mgr = BackupManager({
@@ -45,7 +40,7 @@ backup_mgr = BackupManager({
     "bots": bots_mgr,
     "analytics": analytics_module
 })
-assistant.attach_backup_manager(backup_mgr)  # связываем с ассистентом
+assistant.attach_backup_manager(backup_mgr)
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
@@ -128,6 +123,18 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=BLOCK_RECO
             continue
         await process_history_file(remote, filename, block_records=block_records)
 
+# -------------------- Periodic backup worker --------------------
+async def periodic_backup_worker(interval: int = 3600):
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if getattr(assistant, "ready_for_backup", True):
+                await assistant.save_full_backup()
+            else:
+                logger.info("Backup postponed: assistant still processing")
+        except Exception as e:
+            logger.exception("Periodic backup failed: %s", e)
+
 # -------------------- Startup --------------------
 @app.on_event("startup")
 async def startup_event():
@@ -138,8 +145,9 @@ async def startup_event():
 
     await bots_mgr.load_from_disk()
     await backup_mgr.start_worker()
-    await backup_mgr.restore_backup()  # восстанавливаем полное состояние
+    await backup_mgr.restore_backup()  # восстановление полного состояния
     asyncio.create_task(load_history_files())
+    asyncio.create_task(periodic_backup_worker(BACKUP_INTERVAL_SECONDS))
     logger.info("Startup complete")
 
 # -------------------- Feedback endpoint --------------------
@@ -148,7 +156,7 @@ async def feedback(payload: FeedbackPayload):
     try:
         if hasattr(assistant, "process_feedback"):
             assistant.process_feedback(payload.game_id, payload.crash, payload.bets)
-            await backup_mgr.queue_backup()  # сохраняем после каждого фидбэка
+            # бэкап теперь ставится через периодический worker, не после каждого фидбэка
             return {"status": "ok"}
         else:
             raise RuntimeError("assistant has no process_feedback")
@@ -196,7 +204,6 @@ async def mark_bot_endpoint(user_id: str, info: dict | None = None):
     try:
         await bots_mgr.mark_bot(user_id, info or {})
         await bots_mgr.save_to_disk()
-        await backup_mgr.queue_backup()
         return {"status": "ok"}
     except Exception as e:
         logger.exception("mark_bot failed: %s", e)
@@ -207,7 +214,6 @@ async def unmark_bot_endpoint(user_id: str):
     try:
         await bots_mgr.unmark_bot(user_id)
         await bots_mgr.save_to_disk()
-        await backup_mgr.queue_backup()
         return {"status": "ok"}
     except Exception as e:
         logger.exception("unmark_bot failed: %s", e)
