@@ -1,6 +1,5 @@
 import os
 import time
-import math
 import json
 import logging
 from collections import deque, defaultdict
@@ -70,6 +69,8 @@ class AIAssistant:
 
         # BackupManager
         self.backup_manager = None
+        # Флаг готовности к бэкапу
+        self.ready_for_backup = True
 
         logger.info("AIAssistant initialized")
 
@@ -119,6 +120,9 @@ class AIAssistant:
         self.backup_manager = backup_manager
 
     async def save_full_backup(self):
+        """
+        Асинхронно ставим задачу на бэкап через BackupManager
+        """
         if self.backup_manager is None:
             logger.warning("BackupManager not attached — backup skipped")
             return
@@ -237,7 +241,6 @@ class AIAssistant:
                 hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
                 med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
 
-            # Color pattern correction
             color_weight = 0.05
             pattern = ["green", "pink", "red"]
             pattern_count = self.find_color_pattern(pattern)
@@ -285,6 +288,7 @@ class AIAssistant:
     # Feedback & online learning
     # -------------------------
     def process_feedback(self, game_id: int, crash: float, bets: List[Dict[str, Any]] | None = None):
+        self.ready_for_backup = False  # цикл начат
         ts_now = time.time()
         if bets:
             for b in bets:
@@ -322,6 +326,8 @@ class AIAssistant:
 
         if len(self.training_buffer) >= self.pending_threshold and (time.time() - self.last_trained_at) > self.retrain_min_seconds:
             self._online_train()
+
+        self.ready_for_backup = True  # цикл завершён
 
     # -------------------------
     # Online training
