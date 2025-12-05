@@ -11,10 +11,7 @@ from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
     CRASH_HISTORY_FILES, BLOCK_RECORDS, PRED_LOG_LEN, BACKUP_INTERVAL_SECONDS
 )
-from utils import (
-    yandex_find, yandex_download_stream_json,
-    async_iter_from_thread
-)
+from utils import yandex_find, yandex_download_stream_json
 from bots_manager import BotsManager
 from backup_manager import BackupManager
 from model import AIAssistant
