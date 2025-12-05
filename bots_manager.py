@@ -26,6 +26,7 @@ class BotsManager:
 
         self._lock = asyncio.Lock()
 
+    # -------------------- Загрузка и сохранение --------------------
     async def load_from_disk(self):
         async with self._lock:
             try:
@@ -38,7 +39,8 @@ class BotsManager:
                     payload = json.load(f)
                 self.bots = payload.get("bots", {})
                 self.active_users = payload.get("active_users", {})
-                logger.info("BotsManager: loaded %d bots, %d active users from disk", len(self.bots), len(self.active_users))
+                logger.info("BotsManager: loaded %d bots, %d active users from disk",
+                            len(self.bots), len(self.active_users))
             except Exception as e:
                 logger.exception("BotsManager.load_from_disk failed: %s", e)
 
@@ -59,6 +61,7 @@ class BotsManager:
             except Exception as e:
                 logger.exception("BotsManager.save_to_disk failed: %s", e)
 
+    # -------------------- Работа с ботами и активными пользователями --------------------
     async def mark_bot(self, user_id: str, info: dict):
         async with self._lock:
             now = datetime.utcnow().isoformat()
@@ -82,12 +85,6 @@ class BotsManager:
             self.bots.pop(user_id, None)
 
     async def touch_active_user(self, user_id: str, info: dict | None = None):
-        """
-        Обновление активности пользователя.
-        info может содержать:
-          - last_bet, avg_auto, coefficient, amount и т.п.
-        Добавляем подсчет чистого выигрыша, если известен коэффициент.
-        """
         async with self._lock:
             now = datetime.utcnow().isoformat()
             entry = self.active_users.get(user_id, {})
@@ -118,6 +115,7 @@ class BotsManager:
                     except Exception:
                         info["active"] = False
 
+    # -------------------- Получение информации --------------------
     def get_bot(self, user_id: str):
         return self.bots.get(user_id)
 
@@ -129,25 +127,43 @@ class BotsManager:
             "bots_in_memory": len(self.bots),
             "active_users_in_memory": len(self.active_users)
         }
+
+    # -------------------- Полный бэкап состояния --------------------
+    def export_state(self) -> dict:
+        """Возвращает состояние для полного бэкапа"""
+        return {
+            "bots": self.bots,
+            "active_users": self.active_users
+        }
+
+    def load_state(self, state: dict):
+        """Восстанавливает состояние из полного бэкапа"""
+        self.bots = state.get("bots", {})
+        self.active_users = state.get("active_users", {})
+
     async def save_ai_state(self, assistant, filename="assistant_state.json"):
-    """Сохраняет полное состояние AIAssistant"""
+        """Сохраняет полное состояние AIAssistant вместе с ботами"""
         async with self._lock:
-        state = assistant.export_state()
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        await yandex_upload(filename, self.remote_path.replace(BOTS_FILE, filename), overwrite=True)
-        logger.info("Saved full AIAssistant state to disk/remote")
+            state = {
+                "bots_manager": self.export_state(),
+                "assistant": assistant.export_state()
+            }
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            await yandex_upload(filename, self.remote_path.replace(BOTS_FILE, filename), overwrite=True)
+            logger.info("Saved full AIAssistant state to disk/remote")
 
     async def load_ai_state(self, assistant, filename="assistant_state.json"):
-    """Загружает полное состояние AIAssistant"""
+        """Загружает полное состояние AIAssistant вместе с ботами"""
         async with self._lock:
-        try:
-            local_file = filename
-            remote_file = self.remote_path.replace(BOTS_FILE, filename)
-            await yandex_download_to_file(remote_file, local_file)
-            with open(local_file, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            assistant.load_state(state)
-            logger.info("Loaded full AIAssistant state from disk/remote")
-        except Exception as e:
-            logger.exception("Failed to load AIAssistant state: %s", e)
+            try:
+                local_file = filename
+                remote_file = self.remote_path.replace(BOTS_FILE, filename)
+                await yandex_download_to_file(remote_file, local_file)
+                with open(local_file, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                self.load_state(state.get("bots_manager", {}))
+                assistant.load_state(state.get("assistant", {}))
+                logger.info("Loaded full AIAssistant state from disk/remote")
+            except Exception as e:
+                logger.exception("Failed to load AIAssistant state: %s", e)
