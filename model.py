@@ -5,8 +5,8 @@ import logging
 from collections import deque, defaultdict
 from typing import List, Dict, Any
 import asyncio
-import numpy as np
 import pandas as pd
+import numpy as np
 from lightgbm import LGBMRegressor
 import ably
 from utils import crash_to_color
@@ -29,6 +29,7 @@ class AIAssistant:
                  max_training_buffer: int = 50000,
                  max_active_users: int = 5000,
                  ably_channel: ably.RealtimeChannel | None = None):
+
         self.color_seq_len = color_seq_len
         self.pred_log_len = pred_log_len
         self.pending_threshold = pending_threshold
@@ -65,28 +66,43 @@ class AIAssistant:
         self.last_metrics = {}
         self.total_processed_games = 0
 
+        # Backup
+        self.backup_manager = None
+
         self.ably_channel = ably_channel
 
-        # BackupManager
-        self.backup_manager = None
-        # Флаг готовности к бэкапу
+        # Ready flag для BackupManager
         self.ready_for_backup = True
 
         logger.info("AIAssistant initialized")
 
     # -------------------------
-    # State backup/restore
+    # Full state export/load
     # -------------------------
     def export_state(self) -> Dict[str, Any]:
+        # Сохраняем всё: данные, метрики, модель
+        model_file = f"model_med_{int(time.time())}.json"
+        model_state = None
+        try:
+            self.model_med.booster_.save_model(model_file)
+            with open(model_file, "r", encoding="utf-8") as f:
+                model_state = f.read()
+            os.remove(model_file)
+        except Exception:
+            logger.warning("Failed to export model weights, skipping")
+
         return {
             "pred_log": list(self.pred_log),
             "training_buffer": list(self.training_buffer),
             "history_deque": list(self.history_deque),
             "color_sequence": list(self.color_sequence),
+            "user_stats": dict(self.user_stats),
+            "active_users_queue": list(self.active_users_queue),
+            "bot_set": list(self.bot_set),
             "last_metrics": self.last_metrics,
             "total_processed_games": self.total_processed_games,
-            "bot_list": {uid: self.user_stats.get(uid, {}).get("nickname", "") for uid in self.bot_set},
-            "active_users": {uid: self.user_stats[uid] for uid in self.active_users_queue},
+            "last_trained_at": self.last_trained_at,
+            "model_med": model_state,
             "timestamp": time.time()
         }
 
@@ -96,22 +112,46 @@ class AIAssistant:
             self.training_buffer = deque(state.get("training_buffer", []), maxlen=self.training_buffer.maxlen)
             self.history_deque = deque(state.get("history_deque", []), maxlen=self.history_deque.maxlen)
             self.color_sequence = deque(state.get("color_sequence", []), maxlen=self.color_seq_len)
+            self.user_stats = defaultdict(lambda: {
+                "count": 0,
+                "total_amount": 0.0,
+                "avg_auto": 0.0,
+                "last_active": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_win": 0.0,
+                "nickname": ""
+            }, state.get("user_stats", {}))
+            self.active_users_queue = deque(state.get("active_users_queue", []), maxlen=self.max_active_users)
+            self.bot_set = set(state.get("bot_set", []))
             self.last_metrics = state.get("last_metrics", {})
             self.total_processed_games = state.get("total_processed_games", 0)
+            self.last_trained_at = state.get("last_trained_at", 0)
 
-            bot_list = state.get("bot_list", {})
-            self.bot_set = set(bot_list.keys())
-            for uid, nick in bot_list.items():
-                self.user_stats[uid]["nickname"] = nick
+            model_state = state.get("model_med")
+            if model_state:
+                model_file = f"model_med_restore_{int(time.time())}.json"
+                with open(model_file, "w", encoding="utf-8") as f:
+                    f.write(model_state)
+                self.model_med = LGBMRegressor(n_estimators=120, verbose=-1)
+                self.model_med = LGBMRegressor(model_file)
+                os.remove(model_file)
 
-            active_users = state.get("active_users", {})
-            for uid, stats in active_users.items():
-                self.user_stats[uid] = stats
-                self.active_users_queue.append(uid)
-
-            logger.info("State loaded successfully")
+            logger.info("AIAssistant state loaded successfully")
         except Exception as e:
             logger.exception("Failed to load state: %s", e)
+
+    # -------------------------
+    # Attach BackupManager
+    # -------------------------
+    def attach_backup_manager(self, backup_manager):
+        self.backup_manager = backup_manager
+
+    async def save_full_backup(self):
+        if self.backup_manager:
+            await self.backup_manager.queue_backup()
+        else:
+            logger.warning("BackupManager not attached, backup skipped")
 
     # -------------------------
     # Attach BackupManager
