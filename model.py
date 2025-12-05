@@ -14,10 +14,8 @@ from utils import crash_to_color
 logger = logging.getLogger("ai_assistant.model")
 logger.setLevel(logging.INFO)
 
-
 def clamp(v, a, b):
     return max(a, min(b, v))
-
 
 class AIAssistant:
     def __init__(self,
@@ -28,13 +26,15 @@ class AIAssistant:
                  max_history_records: int = 50000,
                  max_training_buffer: int = 50000,
                  max_active_users: int = 5000,
-                 ably_channel: ably.RealtimeChannel | None = None):
+                 ably_channel: Any = None):  # <- здесь просто Any
 
         self.color_seq_len = color_seq_len
         self.pred_log_len = pred_log_len
         self.pending_threshold = pending_threshold
         self.retrain_min_seconds = retrain_min_minutes * 60
         self.max_active_users = max_active_users
+        # Канал от main.py
+        self.ably_channel = ably_channel
 
         # ---------------- Data structures ----------------
         self.color_sequence = deque(maxlen=color_seq_len)
