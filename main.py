@@ -15,7 +15,7 @@ from config import (
 )
 from utils import yandex_download_to_file, yandex_find, yandex_worker, yandex_worker_task
 from bots_manager import BotsManager
-from analytics import evaluate_predictions_batch
+from analytics import analytics_state, attach_backup_manager, evaluate_predictions_batch
 from backup_manager import BackupManager
 from model import AIAssistant
 
@@ -32,15 +32,18 @@ ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реально
 # -------------------- Core objects --------------------
 assistant = AIAssistant(ably_channel=ably_channel)
 bots_mgr = BotsManager()
-analytics_module = None  # можно создать объект аналитики, если нужно
+
+# Подключаем аналитический модуль
+attach_backup_manager(None)  # временно None, будет заменено после создания BackupManager
 
 # -------------------- Backup Manager --------------------
 backup_mgr = BackupManager({
     "assistant": assistant,
     "bots": bots_mgr,
-    "analytics": analytics_module
+    "analytics": analytics_state
 })
 assistant.attach_backup_manager(backup_mgr)
+attach_backup_manager(backup_mgr)  # теперь аналитика тоже привязана к BackupManager
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
@@ -124,7 +127,7 @@ async def load_history_files(files=CRASH_HISTORY_FILES, block_records=BLOCK_RECO
         await process_history_file(remote, filename, block_records=block_records)
 
 # -------------------- Periodic backup worker --------------------
-async def periodic_backup_worker(interval: int = 3600):
+async def periodic_backup_worker(interval: int = BACKUP_INTERVAL_SECONDS):
     while True:
         await asyncio.sleep(interval)
         try:
@@ -156,7 +159,6 @@ async def feedback(payload: FeedbackPayload):
     try:
         if hasattr(assistant, "process_feedback"):
             assistant.process_feedback(payload.game_id, payload.crash, payload.bets)
-            # бэкап теперь ставится через периодический worker, не после каждого фидбэка
             return {"status": "ok"}
         else:
             raise RuntimeError("assistant has no process_feedback")
