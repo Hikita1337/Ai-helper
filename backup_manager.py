@@ -1,13 +1,3 @@
-"""
-BackupManager.py
-
-Отвечает за полный бэкап состояния AI-помощника:
-- сохранение и восстановление состояния всех модулей (модель, аналитика, боты)
-- работа с локальными файлами и Яндекс.Диском
-- асинхронная очередь, чтобы основной процесс не блокировался
-- контролируемый таймер для выполнения бэкапа раз в час или по запросу
-"""
-
 import asyncio
 import json
 import logging
@@ -16,19 +6,20 @@ import time
 from typing import Any, Dict
 
 from config import BACKUP_FOLDER, FULL_BACKUP_FILE, BACKUP_INTERVAL_SECONDS
-from utils import yandex_upload, yandex_download_to_file, ensure_dir, yandex_find
+from utils import yandex_upload, yandex_download_to_file, ensure_dir, yandex_find, yandex_delete
 
 logger = logging.getLogger("ai_assistant.backup")
 logger.setLevel(logging.INFO)
 
 class BackupManager:
     def __init__(self, assistant_modules: Dict[str, Any]):
-        """
-        assistant_modules: словарь вида {"assistant": модель, "analytics": аналитика, "bots": менеджер_ботов}
-        """
         self.modules = assistant_modules
         self.local_backup_path = os.path.join(BACKUP_FOLDER, FULL_BACKUP_FILE)
-        self.remote_backup_path = "/" + FULL_BACKUP_FILE
+        self.remote_backup_paths = {
+            "current": "/" + FULL_BACKUP_FILE,
+            "old": "/" + FULL_BACKUP_FILE + ".old",
+            "old_old": "/" + FULL_BACKUP_FILE + ".old.old"
+        }
         self._lock = asyncio.Lock()
         self._backup_queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
@@ -40,16 +31,10 @@ class BackupManager:
             logger.info("Backup worker started")
 
     async def queue_backup(self):
-        """
-        Запланировать бэкап. Реально выполнится только при соблюдении таймера.
-        """
         await self._backup_queue.put(True)
         logger.info("Backup queued")
 
     async def _backup_loop(self):
-        """
-        Основной цикл бэкапа: проверяет таймер и готовность модулей перед сохранением.
-        """
         while True:
             await self._backup_queue.get()
             try:
@@ -66,29 +51,17 @@ class BackupManager:
                 self._backup_queue.task_done()
 
     async def _wait_ready_for_backup(self, timeout: int = 60):
-        """
-        Ждём, пока все модули сигнализируют, что можно делать бэкап.
-        Если модуль не имеет атрибута `ready_for_backup`, считаем его готовым.
-        """
         start_time = time.time()
         while True:
-            all_ready = True
-            for module in self.modules.values():
-                ready = getattr(module, "ready_for_backup", True)
-                if not ready:
-                    all_ready = False
-                    break
+            all_ready = all(getattr(module, "ready_for_backup", True) for module in self.modules.values())
             if all_ready:
                 break
             if time.time() - start_time > timeout:
-                logger.warning("Timeout waiting for modules to be ready for backup, forcing backup")
+                logger.warning("Timeout waiting for modules to be ready, forcing backup")
                 break
             await asyncio.sleep(1)
 
     async def _perform_backup(self):
-        """
-        Выполняет фактический бэкап: экспорт состояния модулей, сохранение локально и на Яндекс.Диск.
-        """
         async with self._lock:
             ensure_dir(BACKUP_FOLDER)
             state = {}
@@ -99,7 +72,6 @@ class BackupManager:
                         logger.info("Module '%s' state exported", name)
                     except Exception as e:
                         logger.exception("Failed to export state for %s: %s", name, e)
-
             state["_meta"] = {"timestamp": time.time()}
 
             # Сохраняем локально
@@ -110,23 +82,39 @@ class BackupManager:
             except Exception as e:
                 logger.exception("Failed to save local backup: %s", e)
 
-            # Загружаем на Яндекс.Диск
+            # Ротация и загрузка на Яндекс.Диск
             try:
-                remote_file = await yandex_find(FULL_BACKUP_FILE)
-                if not remote_file:
-                    remote_file = self.remote_backup_path
-                await yandex_upload(self.local_backup_path, remote_file, overwrite=True)
-                logger.info("Backup uploaded to Yandex.Disk: %s", remote_file)
+                # 1. Удаляем самый старый, если существует
+                old_old_remote = self.remote_backup_paths["old_old"]
+                if await yandex_find(old_old_remote):
+                    await yandex_delete(old_old_remote)
+                    logger.info("Deleted old_old backup: %s", old_old_remote)
+
+                # 2. Переименовываем backup.old в backup.old.old
+                old_remote = self.remote_backup_paths["old"]
+                if await yandex_find(old_remote):
+                    await yandex_upload(self.local_backup_path, self.remote_backup_paths["old_old"], overwrite=True)
+                    await yandex_delete(old_remote)
+                    logger.info("Rotated backup.old -> backup.old.old")
+
+                # 3. Переименовываем текущий backup в backup.old
+                current_remote = self.remote_backup_paths["current"]
+                if await yandex_find(current_remote):
+                    await yandex_upload(self.local_backup_path, old_remote, overwrite=True)
+                    await yandex_delete(current_remote)
+                    logger.info("Rotated backup -> backup.old")
+
+                # 4. Загружаем новый backup
+                await yandex_upload(self.local_backup_path, current_remote, overwrite=True)
+                logger.info("Uploaded new backup to Yandex.Disk: %s", current_remote)
+
             except Exception as e:
-                logger.exception("Failed to upload backup to Yandex.Disk: %s", e)
+                logger.exception("Failed to rotate/upload backup on Yandex.Disk: %s", e)
 
     async def restore_backup(self):
-        """
-        Восстанавливает полное состояние всех модулей из бэкапа (локально или с Яндекс.Диска).
-        """
         async with self._lock:
             try:
-                remote_file = await yandex_find(FULL_BACKUP_FILE)
+                remote_file = await yandex_find(self.remote_backup_paths["current"])
                 if remote_file:
                     await yandex_download_to_file(remote_file, self.local_backup_path)
                 if not os.path.exists(self.local_backup_path):
