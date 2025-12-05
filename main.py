@@ -4,8 +4,8 @@ import os
 import logging
 import asyncio
 import json
-from ably import AblyRealtime
 import time
+from ably import AblyRealtime
 
 from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
@@ -39,6 +39,9 @@ backup_mgr = BackupManager({
 })
 assistant.attach_backup_manager(backup_mgr)
 
+# -------------------- Глобальная переменная для фонового воркера --------------------
+yandex_worker_task: asyncio.Task | None = None
+
 # -------------------- API payloads --------------------
 class BetsPayload(BaseModel):
     game_id: int
@@ -55,7 +58,6 @@ class FeedbackPayload(BaseModel):
 FLAG_FILE = "history_processed_flag.json"
 
 async def is_history_processed() -> bool:
-    """Проверяет, обработана ли история"""
     if os.path.exists(FLAG_FILE):
         try:
             with open(FLAG_FILE, "r", encoding="utf-8") as f:
@@ -66,7 +68,6 @@ async def is_history_processed() -> bool:
     return False
 
 async def set_history_processed_flag():
-    """Устанавливает флаг, что история обработана"""
     try:
         with open(FLAG_FILE, "w", encoding="utf-8") as f:
             json.dump({"processed": True, "timestamp": time.time()}, f)
@@ -77,7 +78,6 @@ async def set_history_processed_flag():
 # -------------------- Загрузка истории --------------------
 async def process_history_file(remote_path: str, block_records: int = BLOCK_RECORDS):
     logger.info("Начинаем обработку файла с историей: %s", remote_path)
-
     batch = []
     unique_users = set()
     total_processed = 0
@@ -109,10 +109,11 @@ async def process_history_file(remote_path: str, block_records: int = BLOCK_RECO
                 assistant.load_history_from_list(batch)
             logger.info("Обработан финальный блок из %d игр", len(batch))
 
-        logger.info("Обработка файла %s завершена: всего игр %d, уникальных пользователей %d",
-                    remote_path, total_processed, len(unique_users))
+        logger.info(
+            "Обработка файла %s завершена: всего игр %d, уникальных пользователей %d",
+            remote_path, total_processed, len(unique_users)
+        )
 
-        # Сразу делаем первичный бэкап
         if getattr(assistant, "ready_for_backup", True):
             await assistant.save_full_backup()
             logger.info("Первичный бэкап сохранён после обработки истории")
@@ -147,6 +148,8 @@ async def periodic_backup_worker(interval: int = BACKUP_INTERVAL_SECONDS):
 @app.on_event("startup")
 async def startup_event():
     global yandex_worker_task
+
+    # Запускаем Яндекс воркер один раз
     if yandex_worker_task is None:
         from utils import yandex_worker as _yworker
         yandex_worker_task = asyncio.create_task(_yworker())
