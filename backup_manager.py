@@ -15,7 +15,7 @@ import os
 import time
 from typing import Any, Dict
 
-from config import BACKUP_FOLDER, FULL_BACKUP_FILE, BACKUP_PERIOD_SECONDS
+from config import BACKUP_FOLDER, FULL_BACKUP_FILE, BACKUP_INTERVAL_SECONDS
 from utils import yandex_upload, yandex_download_to_file, ensure_dir, yandex_find
 
 logger = logging.getLogger("ai_assistant.backup")
