@@ -4,7 +4,6 @@ import os
 import logging
 import asyncio
 import json
-from dotenv import load_dotenv
 import ijson
 from ably import AblyRealtime
 import time
@@ -19,7 +18,7 @@ from backup_manager import BackupManager
 from model import AIAssistant
 from analytics import Analytics
 
-load_dotenv()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
 
