@@ -81,6 +81,15 @@ async def yandex_move(src: str, dst: str, overwrite: bool = True):
 async def yandex_get_download_link(remote_path: str) -> str:
     return await run_yandex_task(yadisk_client.get_download_link, remote_path)
 
+async def yandex_download_to_file(remote_path: str, local_path: str, chunk_size: int = DOWNLOAD_CHUNK):
+    """Скачивает файл целиком на диск"""
+    async with aiofiles.open(local_path, "wb") as f:
+        async for block in yandex_download_stream(remote_path, chunk_size=chunk_size):
+            await f.write(block)
+    logger.info("Файл %s скачан на диск", local_path)
+    return local_path
+
+
 
 # --- Потоковое скачивание JSON чанками с корректным UTF-8 ---
 async def yandex_download_stream_json(remote_path: str, chunk_size: int = DOWNLOAD_CHUNK) -> AsyncGenerator[Any, None]:
