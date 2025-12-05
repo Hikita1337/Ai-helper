@@ -8,7 +8,7 @@ import asyncio
 import pandas as pd
 import numpy as np
 from lightgbm import LGBMRegressor
-import ably
+from ably import AblyRealtime
 from utils import crash_to_color
 
 logger = logging.getLogger("ai_assistant.model")
