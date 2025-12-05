@@ -55,7 +55,7 @@ class BackupManager:
             try:
                 await self._wait_ready_for_backup()
                 now = time.time()
-                if now - self._last_backup_time >= BACKUP_PERIOD_SECONDS:
+                if now - self._last_backup_time >= BACKUP_INTERVAL_SECONDS:
                     await self._perform_backup()
                     self._last_backup_time = now
                 else:
