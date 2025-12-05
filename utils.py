@@ -104,36 +104,67 @@ async def yandex_download_to_file(remote_path: str, local_path: str, chunk_size:
 
 
 # --- Потоковое скачивание JSON чанками с корректным UTF-8 ---
-async def yandex_download_stream_json(remote_path: str, chunk_size: int = DOWNLOAD_CHUNK) -> AsyncGenerator[Any, None]:
+async def yandex_download_stream_json(remote_path: str, chunk_size: int = DOWNLOAD_CHUNK):
     """
-    Скачивает JSON файл потоково и возвращает полноценные элементы JSON,
-    корректно собирая элементы, которые могут быть разделены между чанками,
-    с безопасным декодированием UTF-8.
+    Потоковое чтение очень большого JSON-массива с элементами.
+    Работает с файлами >10ГБ. Возвращает элементы по одному.
     """
-    buffer = ""
     decoder = codecs.getincrementaldecoder("utf-8")()
-    
+    buffer = ""
+    inside_array = False
+    decoder_obj = json.JSONDecoder()
+
     async for chunk in yandex_download_stream(remote_path, chunk_size=chunk_size):
         text = decoder.decode(chunk)
         buffer += text
-        while True:
+
+        i = 0
+        while i < len(buffer):
+
+            # Ждём начало массива [
+            if not inside_array:
+                pos = buffer.find("[", i)
+                if pos == -1:
+                    buffer = ""
+                    break
+                inside_array = True
+                i = pos + 1
+                continue
+
+            # Пропускаем лишние символы
+            while i < len(buffer) and buffer[i] in " \n\r\t,":
+                i += 1
+
+            # Конец массива ]
+            if i < len(buffer) and buffer[i] == "]":
+                return
+
+            # Читаем объект
             try:
-                obj, idx = json.JSONDecoder().raw_decode(buffer)
+                obj, idx = decoder_obj.raw_decode(buffer, i)
                 yield obj
-                buffer = buffer[idx:].lstrip(", \n")
+                i = idx
             except json.JSONDecodeError:
+                # нужно больше данных
+                buffer = buffer[i:]
                 break
 
-    # Завершаем декодер, чтобы собрать остаток
-    text = decoder.decode(b"", final=True)
-    buffer += text
-    if buffer.strip():
+        else:
+            buffer = ""
+
+    # Завершение парсера (если остался хвост)
+    tail = decoder.decode(b"", final=True)
+    if tail.strip():
+        buffer += tail
+
+    # Безопасно пытаемся распарсить остаток
+    buffer = buffer.strip()
+    if buffer and buffer != "]":
         try:
-            obj = json.loads(buffer)
+            obj, _ = decoder_obj.raw_decode(buffer)
             yield obj
         except Exception:
-            logger.warning("Оставшиеся данные не удалось распарсить: %s", buffer[:50])
-
+            pass
 
 # --- Помощники ---
 def ensure_dir(path: str):
