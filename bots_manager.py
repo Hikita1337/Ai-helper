@@ -3,6 +3,7 @@
 - хранение в памяти ограниченного набора активных пользователей
 - хранение выявленных ботов (стратегии) (в памяти + persisted на Yandex Disk)
 - поддержка подсчёта чистого выигрыша и анализа коэффициентов
+- полное сохранение состояния для BackupManager
 """
 
 import asyncio
@@ -25,6 +26,18 @@ class BotsManager:
         self.remote_path = BACKUP_FOLDER.rstrip("/") + "/" + BOTS_FILE
 
         self._lock = asyncio.Lock()
+        self.ready_for_backup = True  # для BackupManager
+
+        # BackupManager
+        self.backup_manager = None
+
+    # -------------------- Подключение BackupManager --------------------
+    def attach_backup_manager(self, manager):
+        self.backup_manager = manager
+
+    async def queue_backup(self):
+        if self.backup_manager:
+            await self.backup_manager.queue_backup()
 
     # -------------------- Загрузка и сохранение --------------------
     async def load_from_disk(self):
@@ -80,9 +93,12 @@ class BotsManager:
                 for k in to_remove:
                     self.bots.pop(k, None)
 
+            await self.queue_backup()
+
     async def unmark_bot(self, user_id: str):
         async with self._lock:
             self.bots.pop(user_id, None)
+            await self.queue_backup()
 
     async def touch_active_user(self, user_id: str, info: dict | None = None):
         async with self._lock:
@@ -101,6 +117,8 @@ class BotsManager:
                 to_remove = [k for k, _ in sorted_users[:len(self.active_users)-MAX_ACTIVE_USERS]]
                 for k in to_remove:
                     self.active_users.pop(k, None)
+
+            await self.queue_backup()
 
     async def prune_inactive_bots(self):
         async with self._lock:
@@ -130,40 +148,21 @@ class BotsManager:
 
     # -------------------- Полный бэкап состояния --------------------
     def export_state(self) -> dict:
-        """Возвращает состояние для полного бэкапа"""
+        """Возвращает полное состояние для BackupManager"""
         return {
-            "bots": self.bots,
-            "active_users": self.active_users
+            "bots": self.bots.copy(),
+            "active_users": self.active_users.copy(),
+            "meta": {
+                "local_cache": self.local_cache,
+                "remote_path": self.remote_path
+            },
+            "timestamp": datetime.utcnow().isoformat()
         }
 
     def load_state(self, state: dict):
-        """Восстанавливает состояние из полного бэкапа"""
-        self.bots = state.get("bots", {})
-        self.active_users = state.get("active_users", {})
-
-    async def save_ai_state(self, assistant, filename="assistant_state.json"):
-        """Сохраняет полное состояние AIAssistant вместе с ботами"""
-        async with self._lock:
-            state = {
-                "bots_manager": self.export_state(),
-                "assistant": assistant.export_state()
-            }
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-            await yandex_upload(filename, self.remote_path.replace(BOTS_FILE, filename), overwrite=True)
-            logger.info("Saved full AIAssistant state to disk/remote")
-
-    async def load_ai_state(self, assistant, filename="assistant_state.json"):
-        """Загружает полное состояние AIAssistant вместе с ботами"""
-        async with self._lock:
-            try:
-                local_file = filename
-                remote_file = self.remote_path.replace(BOTS_FILE, filename)
-                await yandex_download_to_file(remote_file, local_file)
-                with open(local_file, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                self.load_state(state.get("bots_manager", {}))
-                assistant.load_state(state.get("assistant", {}))
-                logger.info("Loaded full AIAssistant state from disk/remote")
-            except Exception as e:
-                logger.exception("Failed to load AIAssistant state: %s", e)
+        """Восстанавливает полное состояние из BackupManager"""
+        self.bots = state.get("bots", {}).copy()
+        self.active_users = state.get("active_users", {}).copy()
+        meta = state.get("meta", {})
+        self.local_cache = meta.get("local_cache", self.local_cache)
+        self.remote_path = meta.get("remote_path", self.remote_path)
