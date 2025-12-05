@@ -15,9 +15,9 @@ from config import (
 )
 from utils import yandex_download_to_file, yandex_find, yandex_worker, yandex_worker_task
 from bots_manager import BotsManager
-from analytics import analytics_state, attach_backup_manager, evaluate_predictions_batch
 from backup_manager import BackupManager
 from model import AIAssistant
+from analytics import Analytics
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -32,18 +32,15 @@ ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реально
 # -------------------- Core objects --------------------
 assistant = AIAssistant(ably_channel=ably_channel)
 bots_mgr = BotsManager()
-
-# Подключаем аналитический модуль
-attach_backup_manager(None)  # временно None, будет заменено после создания BackupManager
+analytics_module = Analytics()
 
 # -------------------- Backup Manager --------------------
 backup_mgr = BackupManager({
     "assistant": assistant,
     "bots": bots_mgr,
-    "analytics": analytics_state
+    "analytics": analytics_module
 })
 assistant.attach_backup_manager(backup_mgr)
-attach_backup_manager(backup_mgr)  # теперь аналитика тоже привязана к BackupManager
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
@@ -226,7 +223,7 @@ async def metrics_sample(limit: int = 100):
     try:
         pl = list(getattr(assistant, "pred_log", []))
         data = pl[-limit:]
-        metrics = evaluate_predictions_batch(data)
+        metrics = analytics_module.evaluate_predictions_batch(data)
         return {"metrics": metrics}
     except Exception as e:
         logger.exception("metrics error: %s", e)
