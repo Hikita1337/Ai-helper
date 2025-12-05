@@ -1,6 +1,8 @@
 # Конфигурация / константы
 import os
 from datetime import timedelta
+from dotenv import load_dotenv
+load_dotenv()
 
 PORT = int(os.getenv("PORT", 8000))
 SELF_URL = os.getenv("SELF_URL")
