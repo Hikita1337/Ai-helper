@@ -7,6 +7,7 @@ import json
 import ijson
 from ably import AblyRealtime
 import time
+from collections import defaultdict
 
 from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
@@ -17,7 +18,6 @@ from bots_manager import BotsManager
 from backup_manager import BackupManager
 from model import AIAssistant
 from analytics import Analytics
-
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
@@ -66,28 +66,47 @@ async def process_history_file(remote_path: str, filename: str, block_records: i
                     yield item
 
         batch = []
+        unique_users = set()
+        total_processed = 0
+
         async for item in async_iter_from_thread(iter_items, local_path):
             if isinstance(item, dict) and "bets" in item and isinstance(item["bets"], str):
                 try:
                     item["bets"] = json.loads(item["bets"])
                 except Exception:
                     item["bets"] = []
+
+            # Считаем уникальных пользователей
+            for b in item.get("bets", []):
+                uid = b.get("user_id")
+                if uid is not None:
+                    unique_users.add(uid)
+
             batch.append(item)
+            total_processed += 1
+
             if len(batch) >= block_records:
                 if hasattr(assistant, "load_history_from_list"):
                     assistant.load_history_from_list(batch)
+                logger.info("Processed block of %d games", len(batch))
                 batch.clear()
 
         if batch:
             if hasattr(assistant, "load_history_from_list"):
                 assistant.load_history_from_list(batch)
+            logger.info("Processed final block of %d games", len(batch))
+
+        logger.info("Finished processing %s: total %d games, unique users %d", filename, total_processed, len(unique_users))
 
         try:
             os.remove(local_path)
         except Exception:
             pass
 
-        logger.info("Finished processing %s", filename)
+        # Сразу делаем первичный бэкап
+        if getattr(assistant, "ready_for_backup", True):
+            await assistant.save_full_backup()
+            logger.info("Primary backup saved after processing %s", filename)
     except Exception as e:
         logger.exception("Error processing history file %s: %s", filename, e)
 
@@ -145,11 +164,16 @@ async def startup_event():
     await bots_mgr.load_from_disk()
     await backup_mgr.start_worker()
     await backup_mgr.restore_backup()  # восстановление полного состояния
+
+    # Загрузка истории файлов блоками
     asyncio.create_task(load_history_files())
+
+    # Запуск периодического бэкапа
     asyncio.create_task(periodic_backup_worker(BACKUP_INTERVAL_SECONDS))
+
     logger.info("Startup complete")
 
-# -------------------- Feedback endpoint --------------------
+# -------------------- Остальные эндпоинты --------------------
 @app.post("/feedback")
 async def feedback(payload: FeedbackPayload):
     try:
@@ -162,7 +186,6 @@ async def feedback(payload: FeedbackPayload):
         logger.exception("feedback failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-# -------------------- Monitoring endpoints --------------------
 @app.get("/logs")
 async def logs(limit: int = 20):
     try:
