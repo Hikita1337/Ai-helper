@@ -13,27 +13,32 @@ from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
     CRASH_HISTORY_FILES, BLOCK_RECORDS, PRED_LOG_LEN, BACKUP_INTERVAL_SECONDS
 )
-from utils import yandex_download_to_file, yandex_find, yandex_worker, yandex_worker_task
+from utils import (
+    yandex_find, yandex_download_stream,
+    yandex_worker, yandex_worker_task
+)
 from bots_manager import BotsManager
 from backup_manager import BackupManager
 from model import AIAssistant
 from analytics import Analytics
 
+# -------------------- Настройка логирования --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_assistant.main")
 
+# -------------------- FastAPI --------------------
 app = FastAPI(title="Crash AI Assistant")
 
-# -------------------- Ably setup --------------------
+# -------------------- Настройка Ably --------------------
 ably_client = AblyRealtime(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("ABLU-TAI")
 
-# -------------------- Core objects --------------------
+# -------------------- Основные объекты --------------------
 assistant = AIAssistant(ably_channel=ably_channel)
 bots_mgr = BotsManager()
 analytics_module = Analytics()
 
-# -------------------- Backup Manager --------------------
+# -------------------- Менеджер бэкапов --------------------
 backup_mgr = BackupManager({
     "assistant": assistant,
     "bots": bots_mgr,
@@ -41,7 +46,7 @@ backup_mgr = BackupManager({
 })
 assistant.attach_backup_manager(backup_mgr)
 
-# -------------------- API Payloads --------------------
+# -------------------- Payloads --------------------
 class BetsPayload(BaseModel):
     game_id: int
     deposit_sum: float
@@ -53,11 +58,10 @@ class FeedbackPayload(BaseModel):
     crash: float
     bets: list | None = None
 
-# -------------------- Flag для обработки истории --------------------
+# -------------------- Флаг обработки истории --------------------
 FLAG_FILE = "history_processed_flag.json"
 
 async def is_history_processed() -> bool:
-    """Проверяет наличие флага, что история уже обработана."""
     if os.path.exists(FLAG_FILE):
         try:
             with open(FLAG_FILE, "r", encoding="utf-8") as f:
@@ -68,73 +72,63 @@ async def is_history_processed() -> bool:
     return False
 
 async def set_history_processed_flag():
-    """Создаёт флаг о том, что история обработана."""
     try:
         with open(FLAG_FILE, "w", encoding="utf-8") as f:
             json.dump({"processed": True, "timestamp": time.time()}, f)
+        logger.info("Флаг обработки истории установлен")
     except Exception as e:
-        logger.exception("Failed to set history processed flag: %s", e)
+        logger.exception("Не удалось установить флаг обработки истории: %s", e)
 
-# -------------------- History loader --------------------
-async def process_history_file(remote_path: str, filename: str, block_records: int = BLOCK_RECORDS):
-    logger.info("Processing history file: %s (remote: %s)", filename, remote_path)
-    local_path = filename
+# -------------------- Обработка истории блоками --------------------
+async def process_history_file(remote_path: str, block_records: int = BLOCK_RECORDS):
+    logger.info("Начало обработки истории с файла: %s", remote_path)
+    batch = []
+    unique_users = set()
+    total_processed = 0
+
     try:
-        await yandex_download_to_file(remote_path, local_path)
+        async for chunk in yandex_download_stream(remote_path):
+            # chunk — это часть байтов, нужно превратить в строки и обрабатывать JSON
+            chunk_str = chunk.decode("utf-8")
+            for item in ijson.items(chunk_str, "item"):
+                if isinstance(item, dict) and "bets" in item and isinstance(item["bets"], str):
+                    try:
+                        item["bets"] = json.loads(item["bets"])
+                    except Exception:
+                        item["bets"] = []
 
-        def iter_items(file_path):
-            with open(file_path, "r", encoding="utf-8") as f:
-                for item in ijson.items(f, "item"):
-                    yield item
+                for b in item.get("bets", []):
+                    uid = b.get("user_id")
+                    if uid is not None:
+                        unique_users.add(uid)
 
-        batch = []
-        unique_users = set()
-        total_processed = 0
+                batch.append(item)
+                total_processed += 1
 
-        async for item in async_iter_from_thread(iter_items, local_path):
-            if isinstance(item, dict) and "bets" in item and isinstance(item["bets"], str):
-                try:
-                    item["bets"] = json.loads(item["bets"])
-                except Exception:
-                    item["bets"] = []
-
-            # Считаем уникальных пользователей
-            for b in item.get("bets", []):
-                uid = b.get("user_id")
-                if uid is not None:
-                    unique_users.add(uid)
-
-            batch.append(item)
-            total_processed += 1
-
-            if len(batch) >= block_records:
-                if hasattr(assistant, "load_history_from_list"):
-                    assistant.load_history_from_list(batch)
-                logger.info("Processed block of %d games", len(batch))
-                batch.clear()
+                if len(batch) >= block_records:
+                    if hasattr(assistant, "load_history_from_list"):
+                        assistant.load_history_from_list(batch)
+                    logger.info("Обработан блок из %d игр", len(batch))
+                    batch.clear()
 
         if batch:
             if hasattr(assistant, "load_history_from_list"):
                 assistant.load_history_from_list(batch)
-            logger.info("Processed final block of %d games", len(batch))
+            logger.info("Обработан финальный блок из %d игр", len(batch))
 
-        logger.info("Finished processing %s: total %d games, unique users %d", filename, total_processed, len(unique_users))
-
-        try:
-            os.remove(local_path)
-        except Exception:
-            pass
+        logger.info("Обработка истории завершена: всего игр %d, уникальных пользователей %d", total_processed, len(unique_users))
 
         # Сразу делаем первичный бэкап
         if getattr(assistant, "ready_for_backup", True):
             await assistant.save_full_backup()
-            logger.info("Primary backup saved after processing %s", filename)
+            logger.info("Первичный бэкап сохранён после обработки истории")
 
         # Ставим флаг, что история обработана
         await set_history_processed_flag()
     except Exception as e:
-        logger.exception("Error processing history file %s: %s", filename, e)
+        logger.exception("Ошибка обработки файла истории %s: %s", remote_path, e)
 
+# -------------------- Асинхронный итератор из синхронного потока --------------------
 async def async_iter_from_thread(generator_fn, *args, **kwargs):
     loop = asyncio.get_event_loop()
     q = asyncio.Queue()
@@ -158,15 +152,16 @@ async def async_iter_from_thread(generator_fn, *args, **kwargs):
             raise item
         yield item
 
+# -------------------- Загрузка истории --------------------
 async def load_history_files(files=CRASH_HISTORY_FILES, block_records=BLOCK_RECORDS):
     for filename in files:
         remote = await yandex_find(filename)
         if not remote:
-            logger.warning("History file %s not found on Yandex", filename)
+            logger.warning("Файл истории %s не найден на Яндекс.Диске", filename)
             continue
-        await process_history_file(remote, filename, block_records=block_records)
+        await process_history_file(remote, block_records=block_records)
 
-# -------------------- Periodic backup worker --------------------
+# -------------------- Периодический бэкап --------------------
 async def periodic_backup_worker(interval: int = BACKUP_INTERVAL_SECONDS):
     while True:
         await asyncio.sleep(interval)
@@ -174,9 +169,9 @@ async def periodic_backup_worker(interval: int = BACKUP_INTERVAL_SECONDS):
             if getattr(assistant, "ready_for_backup", True):
                 await assistant.save_full_backup()
             else:
-                logger.info("Backup postponed: assistant still processing")
+                logger.info("Бэкап отложен: ассистент обрабатывает данные")
         except Exception as e:
-            logger.exception("Periodic backup failed: %s", e)
+            logger.exception("Ошибка периодического бэкапа: %s", e)
 
 # -------------------- Startup --------------------
 @app.on_event("startup")
@@ -188,21 +183,18 @@ async def startup_event():
 
     await bots_mgr.load_from_disk()
     await backup_mgr.start_worker()
-    await backup_mgr.restore_backup()  # восстановление полного состояния
+    await backup_mgr.restore_backup()
 
-    # Проверяем, нужно ли обрабатывать историю
     if not await is_history_processed():
-        logger.info("History not yet processed. Starting processing...")
+        logger.info("История ещё не обработана. Начинаем обработку...")
         asyncio.create_task(load_history_files())
     else:
-        logger.info("History already processed. Skipping file processing.")
+        logger.info("История уже обработана. Пропуск обработки.")
 
-    # Запуск периодического бэкапа
     asyncio.create_task(periodic_backup_worker(BACKUP_INTERVAL_SECONDS))
+    logger.info("Сервер запущен и готов к работе")
 
-    logger.info("Startup complete")
-
-# -------------------- Остальные эндпоинты --------------------
+# -------------------- Эндпоинты --------------------
 @app.post("/feedback")
 async def feedback(payload: FeedbackPayload):
     try:
@@ -210,22 +202,9 @@ async def feedback(payload: FeedbackPayload):
             assistant.process_feedback(payload.game_id, payload.crash, payload.bets)
             return {"status": "ok"}
         else:
-            raise RuntimeError("assistant has no process_feedback")
+            raise RuntimeError("Ассистент не имеет метода process_feedback")
     except Exception as e:
-        logger.exception("feedback failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/logs")
-async def logs(limit: int = 20):
-    try:
-        get_pred_log = getattr(assistant, "get_pred_log", None)
-        if callable(get_pred_log):
-            return {"logs": get_pred_log(limit)}
-        else:
-            pl = list(getattr(assistant, "pred_log", []))
-            return {"logs": pl[-limit:]}
-    except Exception as e:
-        logger.exception("logs error: %s", e)
+        logger.exception("Ошибка при feedback: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/status")
@@ -242,40 +221,5 @@ async def status():
         st.update(bots_mgr.summary())
         return st
     except Exception as e:
-        logger.exception("status error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/bots")
-async def bots_list():
-    return bots_mgr.summary()
-
-@app.post("/bots/mark/{user_id}")
-async def mark_bot_endpoint(user_id: str, info: dict | None = None):
-    try:
-        await bots_mgr.mark_bot(user_id, info or {})
-        await bots_mgr.save_to_disk()
-        return {"status": "ok"}
-    except Exception as e:
-        logger.exception("mark_bot failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/bots/unmark/{user_id}")
-async def unmark_bot_endpoint(user_id: str):
-    try:
-        await bots_mgr.unmark_bot(user_id)
-        await bots_mgr.save_to_disk()
-        return {"status": "ok"}
-    except Exception as e:
-        logger.exception("unmark_bot failed: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/metrics")
-async def metrics_sample(limit: int = 100):
-    try:
-        pl = list(getattr(assistant, "pred_log", []))
-        data = pl[-limit:]
-        metrics = analytics_module.evaluate_predictions_batch(data)
-        return {"metrics": metrics}
-    except Exception as e:
-        logger.exception("metrics error: %s", e)
+        logger.exception("Ошибка получения статуса: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
