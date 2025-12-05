@@ -9,7 +9,6 @@ from pydantic import BaseModel
 import os
 import logging
 import asyncio
-import aiofiles
 import json
 from dotenv import load_dotenv
 import ijson
@@ -17,16 +16,15 @@ import ably
 
 from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
-    BACKUP_NAME, BACKUP_FOLDER, CRASH_HISTORY_FILES, BLOCK_RECORDS, BACKUP_PERIOD_SECONDS, PRED_LOG_LEN
+    CRASH_HISTORY_FILES, BLOCK_RECORDS, PRED_LOG_LEN
 )
 from utils import (
-    yandex_download_to_file, yandex_find, yandex_upload, yandex_download_stream,
-    yandex_worker, yandex_queue, yandex_worker_task, yandex_get_download_link, run_yandex_task, yadisk_client
+    yandex_download_to_file, yandex_find,
+    yandex_worker, yandex_worker_task
 )
 from bots_manager import BotsManager
 from analytics import evaluate_predictions_batch
-
-# model import (пользовательский AIAssistant)
+from backup_manager import BackupManager
 from model import AIAssistant
 
 load_dotenv()
@@ -40,65 +38,27 @@ ably_client = ably.RestClient(ABLY_API_KEY)
 ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реального времени
 
 # -------------------- Core objects --------------------
-assistant = AIAssistant(ably_channel=ably_channel)  # передаем канал внутрь ассистента
+assistant = AIAssistant(ably_channel=ably_channel)
 bots_mgr = BotsManager()
+analytics_module = None  # заменить на реальный объект аналитики, если есть
+
+backup_mgr = BackupManager({
+    "assistant": assistant,
+    "bots": bots_mgr,
+    "analytics": analytics_module
+})
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
     game_id: int
     deposit_sum: float
     num_players: int
-    bets: list  # список ставок, каждая ставка: user_id, nickname, amount, coefficient_auto, time_fixed
+    bets: list
 
 class FeedbackPayload(BaseModel):
     game_id: int
     crash: float
     bets: list | None = None
-
-# -------------------- Backup helpers --------------------
-async def save_backup():
-    try:
-        logger.info("Saving backup...")
-        snapshot = {
-            "games_index": list(getattr(assistant, "games_index", [])),
-            "pred_log": list(getattr(assistant, "pred_log", [])[-PRED_LOG_LEN:]),
-            "meta": {
-                "saved_at": asyncio.get_event_loop().time()
-            }
-        }
-        with open(BACKUP_NAME, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f)
-        await yandex_upload(BACKUP_NAME, BACKUP_FOLDER.rstrip("/") + "/" + BACKUP_NAME)
-        logger.info("Backup uploaded successfully")
-    except Exception as e:
-        logger.exception("save_backup failed: %s", e)
-
-async def restore_backup():
-    try:
-        logger.info("Restoring backup if exists...")
-        remote = await yandex_find(BACKUP_NAME)
-        if not remote:
-            logger.warning("No backup found")
-            return
-        local = BACKUP_NAME
-        await yandex_download_to_file(remote, local)
-        with open(local, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        if hasattr(assistant, "load_state"):
-            assistant.load_state(state)
-            logger.info("Assistant state restored from backup")
-        else:
-            logger.warning("Assistant has no load_state method, skipping restore")
-    except Exception as e:
-        logger.exception("restore_backup failed: %s", e)
-
-async def save_backup_loop():
-    while True:
-        try:
-            await save_backup()
-        except Exception as e:
-            logger.exception("save_backup_loop error: %s", e)
-        await asyncio.sleep(BACKUP_PERIOD_SECONDS)
 
 # -------------------- History loader --------------------
 async def process_history_file(remote_path: str, filename: str, block_records: int = BLOCK_RECORDS):
@@ -178,9 +138,10 @@ async def startup_event():
         yandex_worker_task = asyncio.create_task(_yworker())
 
     await bots_mgr.load_from_disk()
-    await restore_backup()
+    await backup_mgr.start_worker()
+    await backup_mgr.restore_backup()
     asyncio.create_task(load_history_files())
-    asyncio.create_task(save_backup_loop())
+
     logger.info("Startup complete")
 
 # -------------------- Feedback endpoint --------------------
@@ -189,6 +150,7 @@ async def feedback(payload: FeedbackPayload):
     try:
         if hasattr(assistant, "process_feedback"):
             assistant.process_feedback(payload.game_id, payload.crash, payload.bets)
+            await backup_mgr.queue_backup()
             return {"status": "ok"}
         else:
             raise RuntimeError("assistant has no process_feedback")
@@ -236,6 +198,7 @@ async def mark_bot_endpoint(user_id: str, info: dict | None = None):
     try:
         await bots_mgr.mark_bot(user_id, info or {})
         await bots_mgr.save_to_disk()
+        await backup_mgr.queue_backup()
         return {"status": "ok"}
     except Exception as e:
         logger.exception("mark_bot failed: %s", e)
@@ -246,6 +209,7 @@ async def unmark_bot_endpoint(user_id: str):
     try:
         await bots_mgr.unmark_bot(user_id)
         await bots_mgr.save_to_disk()
+        await backup_mgr.queue_backup()
         return {"status": "ok"}
     except Exception as e:
         logger.exception("unmark_bot failed: %s", e)
