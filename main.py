@@ -1,7 +1,7 @@
 """
 Основной FastAPI приложение.
-Подключаем BotsManager, utils, analytics; обрабатываем старые файлы истории,
-потоково загружаем большие JSON и парсим их батчами.
+Подключаем BotsManager, utils, analytics и BackupManager;
+обрабатываем старые файлы истории, потоково загружаем большие JSON и парсим их батчами.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -18,10 +18,7 @@ from config import (
     PORT, SELF_URL, ABLY_API_KEY, YANDEX_ACCESS_TOKEN,
     CRASH_HISTORY_FILES, BLOCK_RECORDS, PRED_LOG_LEN
 )
-from utils import (
-    yandex_download_to_file, yandex_find,
-    yandex_worker, yandex_worker_task
-)
+from utils import yandex_download_to_file, yandex_find, yandex_worker, yandex_worker_task
 from bots_manager import BotsManager
 from analytics import evaluate_predictions_batch
 from backup_manager import BackupManager
@@ -40,7 +37,7 @@ ably_channel = ably_client.channels.get("ABLU-TAI")  # канал реально
 # -------------------- Core objects --------------------
 assistant = AIAssistant(ably_channel=ably_channel)
 bots_mgr = BotsManager()
-analytics_module = None  # если есть отдельный объект аналитики, передай сюда
+analytics_module = None  # если позже нужно, можно создать объект аналитики
 
 # -------------------- Backup Manager --------------------
 backup_mgr = BackupManager({
@@ -48,7 +45,7 @@ backup_mgr = BackupManager({
     "bots": bots_mgr,
     "analytics": analytics_module
 })
-assistant.attach_backup_manager(backup_mgr)
+assistant.attach_backup_manager(backup_mgr)  # связываем с ассистентом
 
 # -------------------- API Payloads --------------------
 class BetsPayload(BaseModel):
@@ -139,16 +136,10 @@ async def startup_event():
         from utils import yandex_worker as _yworker
         yandex_worker_task = asyncio.create_task(_yworker())
 
-    # Загружаем состояние ботов
     await bots_mgr.load_from_disk()
-
-    # Запускаем воркер BackupManager и восстанавливаем состояние
     await backup_mgr.start_worker()
-    await backup_mgr.restore_backup()
-
-    # Загружаем историю
+    await backup_mgr.restore_backup()  # восстанавливаем полное состояние
     asyncio.create_task(load_history_files())
-
     logger.info("Startup complete")
 
 # -------------------- Feedback endpoint --------------------
@@ -157,7 +148,7 @@ async def feedback(payload: FeedbackPayload):
     try:
         if hasattr(assistant, "process_feedback"):
             assistant.process_feedback(payload.game_id, payload.crash, payload.bets)
-            await backup_mgr.queue_backup()
+            await backup_mgr.queue_backup()  # сохраняем после каждого фидбэка
             return {"status": "ok"}
         else:
             raise RuntimeError("assistant has no process_feedback")
