@@ -10,8 +10,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
 import ably
-
-from utils import crash_to_color  # единая функция для всех файлов
+from utils import crash_to_color
 
 logger = logging.getLogger("ai_assistant.model")
 logger.setLevel(logging.INFO)
@@ -43,7 +42,7 @@ class AIAssistant:
         self.pred_log = deque(maxlen=pred_log_len)
         self.training_buffer = deque(maxlen=max_training_buffer)
 
-        # Users stats: active users in memory
+        # Users stats
         self.user_stats = defaultdict(lambda: {
             "count": 0,
             "total_amount": 0.0,
@@ -69,15 +68,15 @@ class AIAssistant:
 
         self.ably_channel = ably_channel
 
+        # BackupManager
+        self.backup_manager = None
+
         logger.info("AIAssistant initialized")
 
     # -------------------------
     # State backup/restore
     # -------------------------
     def export_state(self) -> Dict[str, Any]:
-        """
-        Снимок текущего состояния помощника (для будущего внешнего бэкапа)
-        """
         return {
             "pred_log": list(self.pred_log),
             "training_buffer": list(self.training_buffer),
@@ -91,9 +90,6 @@ class AIAssistant:
         }
 
     def load_state(self, state: Dict[str, Any]):
-        """
-        Восстановление состояния помощника из снимка
-        """
         try:
             self.pred_log = deque(state.get("pred_log", []), maxlen=self.pred_log_len)
             self.training_buffer = deque(state.get("training_buffer", []), maxlen=self.training_buffer.maxlen)
@@ -115,6 +111,22 @@ class AIAssistant:
             logger.info("State loaded successfully")
         except Exception as e:
             logger.exception("Failed to load state: %s", e)
+
+    # -------------------------
+    # Attach BackupManager
+    # -------------------------
+    def attach_backup_manager(self, backup_manager):
+        self.backup_manager = backup_manager
+
+    async def save_full_backup(self):
+        if self.backup_manager is None:
+            logger.warning("BackupManager not attached — backup skipped")
+            return
+        try:
+            await self.backup_manager.queue_backup()
+            logger.info("Backup queued for saving AIAssistant state")
+        except Exception as e:
+            logger.exception("Failed to queue AIAssistant backup: %s", e)
 
     # -------------------------
     # User stats management
@@ -185,7 +197,7 @@ class AIAssistant:
     # Color sequence & pattern search
     # -------------------------
     def add_color_to_sequence(self, crash_value: float):
-        color_bucket = crash_to_color(crash_value)  # теперь единая функция из utils
+        color_bucket = crash_to_color(crash_value)
         self.color_sequence.append(color_bucket)
 
     def find_color_pattern(self, pattern: list[str]) -> int:
@@ -197,7 +209,7 @@ class AIAssistant:
                 count += 1
         return count
 
-      # -------------------------
+    # -------------------------
     # Prediction
     # -------------------------
     def predict_and_log(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -225,7 +237,7 @@ class AIAssistant:
                 hist_mean = float(np.mean(hist_crashes)) if hist_crashes else 1.5
                 med_pred = clamp((features["avg_auto"] * 0.6 + hist_mean * 0.4), 1.01, 1000.0)
 
-            # ---- color pattern correction ----
+            # Color pattern correction
             color_weight = 0.05
             pattern = ["green", "pink", "red"]
             pattern_count = self.find_color_pattern(pattern)
@@ -285,7 +297,6 @@ class AIAssistant:
                     taken_coef = auto
                 self._record_user_bet(uid, amt, auto, taken_coef, ts_now, nickname=nickname)
 
-        # Обновляем color_sequence
         if crash is not None:
             self.add_color_to_sequence(crash)
 
@@ -359,29 +370,3 @@ class AIAssistant:
                     successes += 1
                 total += 1
         return round((successes / total) * 100, 1) if total else 0.0
-
-    # -------------------------
-    # Backup integration
-    # -------------------------
-    def attach_backup_manager(self, backup_manager):
-        """
-        Назначает внешний BackupManager для модели.
-        Вызывается из main при инициализации всех модулей.
-        """
-        self.backup_manager = backup_manager
-
-    def save_full_backup(self):
-        """
-        Реальный вызов BackupManager.
-        Запускает асинхронное сохранение состояния без блокировки основного процесса.
-        """
-        if not hasattr(self, "backup_manager") or self.backup_manager is None:
-            logger.warning("BackupManager not attached — backup skipped")
-            return
-
-        try:
-            # Асинхронно ставим задачу в очередь BackupManager
-            asyncio.create_task(self.backup_manager.queue_backup())
-            logger.info("Backup queued for saving")
-        except Exception as e:
-            logger.exception("Failed to queue backup: %s", e)
