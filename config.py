@@ -10,10 +10,10 @@ ABLY_API_KEY = os.getenv("ABLY_API_KEY")
 YANDEX_ACCESS_TOKEN = os.getenv("YANDEX_ACCESS_TOKEN")
 
 # Файлы/пути на Yandex Disk
-BACKUP_FOLDER = "/"  # корень, можно сменить
+BACKUP_FOLDER = "backups"  # корень, можно сменить
 BOTS_FILE = "assistant_bots.json"         # хранит: bots + active_users метаданные
 CRASH_HISTORY_FILES = ["crash_23k.json"]  # список имен файлов для первичной загрузки
-FULL_BACKUP_FILE = "/full_backup.json"  # путь и имя основного бэкапа
+FULL_BACKUP_FILE = "full_backup.json"  # путь и имя основного бэкапа
 BACKUP_INTERVAL_SECONDS = 3600          # интервал бэкапа
 
 # Параметры обработки
