@@ -5,17 +5,21 @@
 
 from typing import List, Dict, Any
 import logging
-import time
 
 from utils import calculate_net_win, crash_to_color
-from backup_manager import BackupManager  # полноценный файл для бэкапа
-from config import BACKUP_FOLDER
 
 logger = logging.getLogger("ai_assistant.analytics")
 
-backup_manager = BackupManager()  # создаем объект для работы с бэкапом
+# -------------------------
+# Внутренние данные аналитики (в памяти)
+# -------------------------
+pred_history: List[Dict[str, Any]] = []
+other_metrics: Dict[str, Any] = {}
 
 
+# -------------------------
+# Функции расчёта ошибок и метрик
+# -------------------------
 def compute_avg_relative_error(preds: List[float], actuals: List[float]) -> float:
     errors = []
     for p, a in zip(preds, actuals):
@@ -97,28 +101,25 @@ def annotate_crash_colors(crash: float) -> str:
 
 
 # -------------------------
-# Интеграция с BackupManager
+# Интерфейс для BackupManager
 # -------------------------
-def save_analytics_state(state: Dict[str, Any]):
+def export_state() -> dict:
     """
-    Сохраняет текущее состояние аналитики через BackupManager
+    Экспортирует внутреннее состояние аналитики для резервного копирования
     """
-    try:
-        backup_manager.save_state("analytics", state)
-        logger.info("Analytics state saved via BackupManager")
-    except Exception as e:
-        logger.exception("Failed to save analytics state via BackupManager: %s", e)
+    return {
+        "pred_history": pred_history,
+        "other_metrics": other_metrics
+    }
 
 
-def load_analytics_state() -> Dict[str, Any]:
+def load_state(state: dict):
     """
-    Загружает состояние аналитики через BackupManager
+    Загружает состояние аналитики из бэкапа
     """
     try:
-        state = backup_manager.load_state("analytics")
-        if state is None:
-            return {}
-        return state
+        global pred_history, other_metrics
+        pred_history = state.get("pred_history", [])
+        other_metrics = state.get("other_metrics", {})
     except Exception as e:
-        logger.exception("Failed to load analytics state via BackupManager: %s", e)
-        return {}
+        logger.exception("Failed to load analytics state: %s", e)
