@@ -22,11 +22,17 @@ class BackupManager:
     def __init__(self, assistant_modules: Dict[str, Any]):
         self.modules = assistant_modules
 
-        # Локальный путь (теперь корректный)
+        # Локальный путь: создаём папку BACKUP_FOLDER (если задана не корень)
         ensure_dir(BACKUP_FOLDER)
-        self.local_backup_path = os.path.join(BACKUP_FOLDER, FULL_BACKUP_FILE)
+        # Если BACKUP_FOLDER == '/' или пусто — положим локальный файл в текущую папку './backups'
+        if not BACKUP_FOLDER or BACKUP_FOLDER == "/":
+            local_folder = os.path.join(os.getcwd(), "backups")
+            ensure_dir(local_folder)
+            self.local_backup_path = os.path.join(local_folder, FULL_BACKUP_FILE)
+        else:
+            self.local_backup_path = os.path.join(BACKUP_FOLDER, FULL_BACKUP_FILE)
 
-        # Пути на Яндекс.Диске
+        # Пути на Яндекс.Диске (в корне диска)
         self.remote_backup_paths = {
             "current": "/" + FULL_BACKUP_FILE,
             "old": "/" + FULL_BACKUP_FILE + ".old",
@@ -58,7 +64,7 @@ class BackupManager:
                     await self._perform_backup()
                     self._last_backup_time = now
                 else:
-                    logger.info("Backup skipped: period not reached yet")
+                    logger.info("Backup skipped: период ещё не достигнут")
             except Exception as e:
                 logger.exception("Backup worker failed: %s", e)
             finally:
@@ -67,9 +73,7 @@ class BackupManager:
     async def _wait_ready_for_backup(self, timeout: int = 60):
         start = time.time()
         while True:
-            ready = all(
-                getattr(m, "ready_for_backup", True) for m in self.modules.values()
-            )
+            ready = all(getattr(m, "ready_for_backup", True) for m in self.modules.values())
             if ready:
                 return
 
@@ -81,9 +85,11 @@ class BackupManager:
 
     async def _perform_backup(self):
         async with self._lock:
-            ensure_dir(BACKUP_FOLDER)
+            # локальная папка уже создана в __init__, но на всякий случай
+            local_dir = os.path.dirname(self.local_backup_path)
+            ensure_dir(local_dir)
 
-            # Забираем состояние всех модулей
+            # Собираем состояние
             state = {}
             for name, module in self.modules.items():
                 if hasattr(module, "export_state"):
@@ -91,9 +97,7 @@ class BackupManager:
                         state[name] = module.export_state()
                         logger.info("Module '%s' state exported", name)
                     except Exception as e:
-                        logger.exception(
-                            "Failed to export state for %s: %s", name, e
-                        )
+                        logger.exception("Failed to export state for %s: %s", name, e)
 
             state["_meta"] = {"timestamp": time.time()}
 
@@ -101,47 +105,49 @@ class BackupManager:
             try:
                 with open(self.local_backup_path, "w", encoding="utf-8") as f:
                     json.dump(state, f, ensure_ascii=False, indent=2)
-
                 logger.info("Backup saved locally: %s", self.local_backup_path)
-
+            except PermissionError as pe:
+                logger.exception("Нет прав на запись локального бэкапа %s: %s", self.local_backup_path, pe)
+                return
             except Exception as e:
                 logger.exception("Failed to save local backup: %s", e)
-                return  # Дальше идти нет смысла
+                return
 
-            # Ротация на Я.Диске
+            # Ротация и загрузка на Я.Диск
             try:
                 paths = self.remote_backup_paths
 
-                # 1. Удаляем .old.old
+                # 1. Удаляем .old.old (если есть)
                 if await yandex_find(paths["old_old"]):
                     await yandex_remove(paths["old_old"])
-                    logger.info("Deleted old_old backup")
+                    logger.info("Deleted old_old backup: %s", paths["old_old"])
 
-                # 2. old → old_old
+                # 2. old -> old_old (если old существует)
                 if await yandex_find(paths["old"]):
                     await yandex_upload(self.local_backup_path, paths["old_old"], overwrite=True)
                     await yandex_remove(paths["old"])
-                    logger.info("Rotated old → old_old")
+                    logger.info("Rotated old -> old_old")
 
-                # 3. current → old
+                # 3. current -> old (если current существует)
                 if await yandex_find(paths["current"]):
                     await yandex_upload(self.local_backup_path, paths["old"], overwrite=True)
                     await yandex_remove(paths["current"])
-                    logger.info("Rotated current → old")
+                    logger.info("Rotated current -> old")
 
-                # 4. Загружаем новый current
+                # 4. Загружаем новый current (в корень Диска)
                 await yandex_upload(self.local_backup_path, paths["current"], overwrite=True)
                 logger.info("Uploaded new backup to Yandex: %s", paths["current"])
 
             except Exception as e:
                 logger.exception("Failed to rotate/upload backup: %s", e)
 
-            # Удаляем локальный файл
+            # Удаляем локальную копию (чтобы не занимать диск)
             try:
                 os.remove(self.local_backup_path)
                 logger.info("Local backup removed: %s", self.local_backup_path)
             except Exception:
-                pass
+                # не критично, просто логируем на уровне debug
+                logger.debug("Не удалось удалить локальный бэкап %s (возможно уже удалён)", self.local_backup_path)
 
     async def restore_backup(self):
         async with self._lock:
@@ -151,7 +157,7 @@ class BackupManager:
                     await yandex_download_to_file(remote_file, self.local_backup_path)
 
                 if not os.path.exists(self.local_backup_path):
-                    logger.warning("No local backup found for restore")
+                    logger.warning("No local backup found for restore: %s", self.local_backup_path)
                     return
 
                 with open(self.local_backup_path, "r", encoding="utf-8") as f:
@@ -166,7 +172,12 @@ class BackupManager:
                         except Exception as e:
                             logger.exception("Failed to load %s: %s", name, e)
 
-                logger.info("Backup restored successfully")
+                # После успешного восстановления можно удалить локальный файл
+                try:
+                    os.remove(self.local_backup_path)
+                except Exception:
+                    pass
 
+                logger.info("Backup restored successfully")
             except Exception as e:
                 logger.exception("Failed to restore backup: %s", e)
