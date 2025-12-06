@@ -55,26 +55,66 @@ class FeedbackPayload(BaseModel):
     bets: list | None = None
 
 # -------------------- Флаг обработки истории --------------------
-FLAG_FILE = "history_processed_flag.json"
+HISTORY_FLAG_FILE = "history_processed_flag.json"
 
 async def is_history_processed() -> bool:
-    if os.path.exists(FLAG_FILE):
-        try:
-            with open(FLAG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return data.get("processed", False)
-        except Exception:
-            return False
-    return False
+    """
+    Проверяем флаг на Яндекс.Диске.
+    Если файла нет — история не обработана.
+    """
+    remote = await yandex_find(HISTORY_FLAG_FILE)
+    if not remote:
+        return False
+
+    # Читаем JSON через потоковый загрузчик
+    try:
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        buffer = ""
+
+        async for chunk in yandex_download_stream(remote):
+            buffer += decoder.decode(chunk)
+
+        data = json.loads(buffer)
+        return data.get("processed", False)
+    except Exception as e:
+        logger.exception("Ошибка чтения флага истории с Яндекс.Диска: %s", e)
+        return False
 
 async def set_history_processed_flag():
-    try:
-        with open(FLAG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"processed": True, "timestamp": time.time()}, f)
-        logger.info("Флаг обработки истории установлен")
-    except Exception as e:
-        logger.exception("Не удалось установить флаг истории: %s", e)
+    """
+    Записываем JSON-флаг на Яндекс.Диск.
+    Локальный файл сохраняется во временную папку только для upload.
+    """
+    flag_data = {
+        "processed": True,
+        "timestamp": time.time()
+    }
 
+    temp_path = "/tmp/history_flag.json"
+
+    try:
+        # Пишем локально
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(flag_data, f, ensure_ascii=False)
+
+        # Загружаем в корневую директорию Яндекс.Диска
+        await yandex_upload(
+            temp_path,
+            "/" + HISTORY_FLAG_FILE,
+            overwrite=True
+        )
+
+        logger.info("Флаг обработки истории успешно сохранён на Яндекс.Диске")
+
+    except Exception as e:
+        logger.exception("Ошибка сохранения флага истории: %s", e)
+
+    finally:
+        # Убираем временный файл, если он существует
+        try:
+            os.remove(temp_path)
+        except:
+            pass
 # -------------------- Загрузка истории --------------------
 async def process_history_file(remote_path: str, block_records: int = BLOCK_RECORDS):
     logger.info("Начинаем обработку файла с историей: %s", remote_path)
